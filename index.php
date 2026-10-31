@@ -642,9 +642,22 @@ async function testOltConnection(brand = 'all') {
         Object.keys(results).forEach(k => {
             const r = results[k];
             const badge = r.success ? '✅ TERHUBUNG' : '❌ TIDAK DAPAT DIAKSES';
-            lines.push(`<div><strong>[${k.toUpperCase()} - ${escapeHtml(r.olt_name || '')}] ${badge}:</strong> ${escapeHtml(r.message || '')}</div>`);
+            lines.push(`<div style="margin-bottom:4px;"><strong>[${k.toUpperCase()} - ${escapeHtml(r.olt_name || '')}] ${badge}:</strong> ${escapeHtml(r.message || '')}</div>`);
+            if (r.steps) {
+                const st = r.steps;
+                const icon = s => s === 'ok' ? '🟢' : (s === 'failed' ? '🔴' : '⚪');
+                lines.push(`<div style="margin-left:16px; font-size:12px; color:#cbd5e1;">` +
+                    `${icon(st.ip_reachability?.status)} IP: ${escapeHtml(st.ip_reachability?.detail || '-')} &nbsp;|&nbsp; ` +
+                    `${icon(st.port_access?.status)} Port: ${escapeHtml(st.port_access?.detail || '-')} &nbsp;|&nbsp; ` +
+                    `${icon(st.authentication?.status)} Auth: ${escapeHtml(st.authentication?.detail || '-')} &nbsp;|&nbsp; ` +
+                    `${icon(st.onu_data_fetch?.status)} Data ONU: ${escapeHtml(st.onu_data_fetch?.detail || '-')}` +
+                    `</div>`);
+            }
             if (r.reading_validation) {
-                lines.push(`<div style="margin-left:16px; font-size:12.5px;">↳ ${escapeHtml(r.reading_validation.validation_message || '')}</div>`);
+                lines.push(`<div style="margin-left:16px; font-size:12.5px; margin-top:2px;">↳ ${escapeHtml(r.reading_validation.validation_message || '')} (Tx terbaca: ${r.reading_validation.valid_tx_readings ?? 0} ONU)</div>`);
+            }
+            if (!r.success && r.failure_cause?.cause) {
+                lines.push(`<div style="margin-left:16px; font-size:12px; color:#fca5a5;">↳ Penyebab Spesifik: ${escapeHtml(r.failure_cause.cause)}</div>`);
             }
             if (!r.success && r.diagnostics && Array.isArray(r.diagnostics.hints)) {
                 r.diagnostics.hints.forEach(h => {

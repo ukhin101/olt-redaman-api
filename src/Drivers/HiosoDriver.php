@@ -6,6 +6,7 @@ use Exception;
 use OltRedaman\Config\EnvLoader;
 use OltRedaman\Contracts\OltDriverInterface;
 use OltRedaman\Support\Logger;
+use OltRedaman\Support\NetworkProbe;
 use OltRedaman\Support\OnuDataNormalizer;
 
 /**
@@ -35,6 +36,9 @@ class HiosoDriver implements OltDriverInterface
     private array $config;
     private string $lastError = '';
     private string $detectedProfileName = '';
+    private ?array $deviceInfo = null;
+    private array $detectedPonIds = [];
+    private ?array $lastAuthError = null;
 
     /**
      * Daftar profil OID resmi untuk berbagai varian firmware OLT HIOSO.
@@ -109,165 +113,284 @@ class HiosoDriver implements OltDriverInterface
         return $this->config;
     }
 
+    private function hasHttpCredentials(): bool
+    {
+        $u = trim((string)$this->config['username']);
+        $p = (string)$this->config['password'];
+        return $u !== '' && $p !== '' && $p !== 'your_hioso_password_here';
+    }
+
     /**
-     * Menguji koneksi ke OLT HIOSO (SNMP / HTTP / Telnet sesuai konfigurasi)
-     * dan memberikan laporan diagnosa lengkap jika OLT tidak dapat diakses.
+     * Menguji koneksi ke OLT HIOSO secara bertahap (read-only):
+     *  1. Keterjangkauan IP (ICMP ping)
+     *  2. Akses port (HTTP GoAhead-Webs / SNMP / Telnet)
+     *  3. Autentikasi (HTTP Basic Auth / SNMP Community / Telnet)
+     *  4. Pengambilan data ONU/ONT + informasi perangkat
+     * Password tidak pernah ditampilkan dalam hasil diagnostik.
      */
     public function testConnection(): array
     {
-        $checkedAt = date('c');
-        $host      = $this->config['host'];
-        $method    = $this->config['method'];
+        $checkedAt  = date('c');
+        $host       = $this->config['host'];
+        $method     = $this->config['method'];
+        $httpPort   = (int)$this->config['http_port'];
+        $telnetPort = (int)$this->config['telnet_port'];
+        $snmpPort   = (int)$this->config['snmp_port'];
+
+        $steps = [
+            'ip_reachability' => ['status' => 'skipped'],
+            'port_access'     => ['status' => 'skipped'],
+            'authentication'  => ['status' => 'skipped'],
+            'onu_data_fetch'  => ['status' => 'skipped'],
+        ];
 
         $diagnostics = [
             'configured_enabled' => (bool)$this->config['enabled'],
             'host'               => $host,
             'method_configured'  => $method,
+            'username'           => $this->config['username'],
+            'password_set'       => $this->hasHttpCredentials(),
             'php_snmp_extension' => function_exists('snmp2_walk'),
-            'snmp_port'          => (int)$this->config['snmp_port'],
-            'http_port'          => (int)$this->config['http_port'],
-            'telnet_port'        => (int)$this->config['telnet_port'],
+            'snmp_port'          => $snmpPort,
+            'http_port'          => $httpPort,
+            'telnet_port'        => $telnetPort,
             'snmp_reachable'     => false,
             'http_reachable'     => false,
             'telnet_reachable'   => false,
             'sys_descr'          => null,
             'sys_object_id'      => null,
+            'olt_device'         => null,
             'detected_profile'   => null,
             'hints'              => [],
         ];
 
-        if (empty($host)) {
+        $fail = function (string $message, ?array $cause, array $hints, ?float $lat = null) use (&$steps, &$diagnostics, $host, $method, $checkedAt) {
+            $diagnostics['hints'] = $hints;
             return [
-                'success'     => false,
-                'brand'       => 'HIOSO',
-                'olt_name'    => $this->getName(),
-                'host'        => '(kosong)',
-                'method_used' => $method,
-                'latency_ms'  => null,
-                'message'     => 'Alamat IP / Host OLT HIOSO belum diatur pada file .env (HIOSO_HOST).',
-                'diagnostics' => $diagnostics,
-                'checked_at'  => $checkedAt,
+                'success'       => false,
+                'brand'         => 'HIOSO',
+                'olt_name'      => $this->getName(),
+                'host'          => $host,
+                'method_used'   => $method,
+                'latency_ms'    => $lat,
+                'message'       => $message,
+                'failure_cause' => $cause,
+                'steps'         => $steps,
+                'diagnostics'   => $diagnostics,
+                'checked_at'    => $checkedAt,
             ];
+        };
+
+        if (!$this->config['enabled']) {
+            return $fail('Modul OLT HIOSO dinonaktifkan (HIOSO_ENABLED=false).', ['stage' => 'config', 'cause' => 'HIOSO_ENABLED=false di .env.'], []);
+        }
+        if (empty($host)) {
+            return $fail('Alamat IP / Host OLT HIOSO belum diatur pada file .env (HIOSO_HOST).', ['stage' => 'config', 'cause' => 'HIOSO_HOST kosong.'], []);
         }
 
-        $t0 = microtime(true);
+        // Langkah 1: Keterjangkauan IP (ICMP Ping)
+        $ping = NetworkProbe::ping($host);
+        $steps['ip_reachability'] = [
+            'status'     => $ping['reachable'] === true ? 'ok' : ($ping['reachable'] === false ? 'failed' : 'unknown'),
+            'latency_ms' => $ping['latency_ms'],
+            'detail'     => $ping['note'],
+        ];
 
-        // 1. Uji SNMP jika method = snmp atau auto
-        if (in_array($method, ['snmp', 'auto'], true)) {
-            $sysDescr = $this->snmpWalk('.1.3.6.1.2.1.1.1');
-            if ($sysDescr !== false && !empty($sysDescr)) {
-                $latencyMs = round((microtime(true) - $t0) * 1000, 2);
+        // Langkah 2: Pemeriksaan akses port sesuai metode
+        $httpTcp   = in_array($method, ['http', 'auto'], true) ? NetworkProbe::tcp($host, $httpPort, 3) : ['open' => false, 'latency_ms' => null, 'error' => 'skipped'];
+        $telnetTcp = in_array($method, ['telnet', 'auto'], true) ? NetworkProbe::tcp($host, $telnetPort, 2) : ['open' => false, 'latency_ms' => null, 'error' => 'skipped'];
+
+        $diagnostics['http_reachable']   = (bool)$httpTcp['open'];
+        $diagnostics['telnet_reachable'] = (bool)$telnetTcp['open'];
+
+        if (in_array($method, ['snmp', 'auto'], true) && function_exists('snmp2_get')) {
+            $sysDescrVal = @snmp2_get($host, $this->config['snmp_community'], '.1.3.6.1.2.1.1.1.0', 1200000, 1);
+            if ($sysDescrVal !== false) {
                 $diagnostics['snmp_reachable'] = true;
-                $diagnostics['sys_descr']      = trim(str_replace(['STRING:', '"'], '', (string)reset($sysDescr)));
-
-                $sysObj = $this->snmpWalk('.1.3.6.1.2.1.1.2.0');
-                if (is_array($sysObj) && !empty($sysObj)) {
-                    $diagnostics['sys_object_id'] = trim((string)reset($sysObj));
-                }
-
-                $profile = $this->detectSnmpProfile();
-                if ($profile !== null) {
-                    $diagnostics['detected_profile'] = $this->detectedProfileName . ' (' . ($profile['description'] ?? '') . ')';
-                    return [
-                        'success'     => true,
-                        'brand'       => 'HIOSO',
-                        'olt_name'    => $this->getName(),
-                        'host'        => "{$host}:{$this->config['snmp_port']}",
-                        'method_used' => "snmp ({$this->detectedProfileName})",
-                        'latency_ms'  => $latencyMs,
-                        'message'     => "Berhasil terhubung ke OLT HIOSO ({$host}) via SNMP v2c dalam {$latencyMs} ms. Profil MIB terdeteksi: {$this->detectedProfileName}.",
-                        'diagnostics' => $diagnostics,
-                        'checked_at'  => $checkedAt,
-                    ];
-                }
-
-                $diagnostics['hints'][] = 'SNMP merespon sysDescr, namun pohon OID ONU Hioso tidak ditemukan atau semua PON masih kosong.';
-                if ($method === 'snmp') {
-                    return [
-                        'success'     => false,
-                        'brand'       => 'HIOSO',
-                        'olt_name'    => $this->getName(),
-                        'host'        => "{$host}:{$this->config['snmp_port']}",
-                        'method_used' => 'snmp',
-                        'latency_ms'  => $latencyMs,
-                        'message'     => "Koneksi SNMP ke {$host} berhasil (sysDescr: {$diagnostics['sys_descr']}), namun OID ONU HIOSO belum merespon data.",
-                        'diagnostics' => $diagnostics,
-                        'checked_at'  => $checkedAt,
-                    ];
+                $diagnostics['sys_descr']      = trim(str_replace(['STRING:', '"', '\\"'], '', (string)$sysDescrVal));
+                $sysObjVal = @snmp2_get($host, $this->config['snmp_community'], '.1.3.6.1.2.1.1.2.0', 1200000, 1);
+                if ($sysObjVal !== false) {
+                    $diagnostics['sys_object_id'] = trim((string)$sysObjVal);
                 }
             }
         }
 
-        // 2. Uji HTTP Web jika method = http atau auto
-        if (in_array($method, ['http', 'auto'], true)) {
-            $httpPort = (int)$this->config['http_port'];
-            $tHttp    = microtime(true);
-            $fpHttp   = @fsockopen($host, $httpPort, $eCode, $eStr, 3);
-            if ($fpHttp) {
-                fclose($fpHttp);
-                $latencyMs = round((microtime(true) - $tHttp) * 1000, 2);
-                $diagnostics['http_reachable'] = true;
+        $anyPortOpen = $diagnostics['http_reachable'] || $diagnostics['snmp_reachable'] || $diagnostics['telnet_reachable'];
+        $steps['port_access'] = [
+            'status'      => $anyPortOpen ? 'ok' : 'failed',
+            'http_port'   => ['port' => $httpPort, 'open' => $diagnostics['http_reachable'], 'latency_ms' => $httpTcp['latency_ms']],
+            'snmp_port'   => ['port' => $snmpPort, 'open' => $diagnostics['snmp_reachable']],
+            'telnet_port' => ['port' => $telnetPort, 'open' => $diagnostics['telnet_reachable'], 'latency_ms' => $telnetTcp['latency_ms']],
+            'detail'      => $anyPortOpen
+                ? 'Port komunikasi OLT HIOSO terbuka (' . implode(', ', array_keys(array_filter([
+                    "HTTP:{$httpPort}"     => $diagnostics['http_reachable'],
+                    "SNMP:{$snmpPort}"     => $diagnostics['snmp_reachable'],
+                    "Telnet:{$telnetPort}" => $diagnostics['telnet_reachable'],
+                ]))) . ').'
+                : 'Semua port komunikasi HIOSO (HTTP/SNMP/Telnet) tidak dapat diakses.',
+        ];
 
-                if ($method === 'http' || !$diagnostics['snmp_reachable']) {
-                    return [
-                        'success'     => true,
-                        'brand'       => 'HIOSO',
-                        'olt_name'    => $this->getName(),
-                        'host'        => "{$host}:{$httpPort}",
-                        'method_used' => 'http',
-                        'latency_ms'  => $latencyMs,
-                        'message'     => "Berhasil terhubung ke Web Management OLT HIOSO ({$host}:{$httpPort}) dalam {$latencyMs} ms.",
-                        'diagnostics' => $diagnostics,
-                        'checked_at'  => $checkedAt,
-                    ];
-                }
-            }
+        if (!$anyPortOpen) {
+            Logger::warning('HIOSO', "Tes koneksi gagal (semua port tertutup/timeout) ke {$host}");
+            return $fail(
+                "OLT HIOSO ({$host}) tidak dapat dijangkau dari server XAMPP.",
+                ['stage' => 'network', 'cause' => "IP {$host} tidak merespons pada port HTTP {$httpPort}, SNMP {$snmpPort}, maupun Telnet {$telnetPort}."],
+                [
+                    "Pastikan perangkat OLT HIOSO ({$host}) menyala dan terhubung ke jaringan/router yang dapat diakses dari server XAMPP.",
+                    "Periksa kembali HIOSO_HOST pada file .env.",
+                    "Detail TCP HTTP {$httpPort}: " . ($httpTcp['error'] ?? '-'),
+                ]
+            );
         }
 
-        // 3. Uji Telnet jika method = telnet atau auto
-        if (in_array($method, ['telnet', 'auto'], true)) {
-            $telnetPort = (int)$this->config['telnet_port'];
-            $tTel       = microtime(true);
-            $fpTel      = @fsockopen($host, $telnetPort, $eCode, $eStr, 3);
-            if ($fpTel) {
-                fclose($fpTel);
-                $latencyMs = round((microtime(true) - $tTel) * 1000, 2);
-                $diagnostics['telnet_reachable'] = true;
+        // Langkah 3 & 4 (Jalur Utama Web GoAhead-Webs bila HTTP terbuka pada mode http/auto)
+        if (in_array($method, ['http', 'auto'], true) && $diagnostics['http_reachable']) {
+            try {
+                if (!$this->hasHttpCredentials()) {
+                    throw new Exception('Kredensial Web HIOSO belum diatur pada file .env (HIOSO_USERNAME / HIOSO_PASSWORD).');
+                }
+                $devInfo = $this->loadWebSystemInfo();
+                $diagnostics['olt_device'] = $devInfo;
+
+                $steps['authentication'] = [
+                    'status'   => 'ok',
+                    'username' => $this->config['username'],
+                    'variant'  => 'http_basic_goahead',
+                    'detail'   => 'Autentikasi HTTP Basic ke Web Management GoAhead-Webs berhasil.',
+                ];
+
+                $allPage = $this->httpGetGoAhead('/onuAllPonOnuList.asp');
+                $onuMap  = [];
+                if ($allPage['code'] === 200 && $allPage['body'] !== '') {
+                    $this->parseHiosoAspHtml($allPage['body'], 1, $onuMap);
+                }
+                if (empty($onuMap)) {
+                    $ponIds = !empty($this->detectedPonIds) ? $this->detectedPonIds : ['0/1/1', '0/1/2'];
+                    foreach ($ponIds as $idxPon => $ponIdStr) {
+                        $pRes = $this->httpGetGoAhead('/onuConfigOnuList.asp?oltponno=' . rawurlencode($ponIdStr));
+                        if ($pRes['code'] === 200) {
+                            $this->parseHiosoAspHtml($pRes['body'], $idxPon + 1, $onuMap);
+                        }
+                    }
+                }
+
+                $steps['onu_data_fetch'] = [
+                    'status'    => 'ok',
+                    'pon_ports' => count($this->detectedPonIds) ?: ($devInfo['pon_ports'] ?? (int)$this->config['pon_ports']),
+                    'onu_count' => count($onuMap),
+                    'detail'    => 'Berhasil membaca ' . count($onuMap) . ' ONU beserta Rx Power & Tx Power dari Web Management HIOSO.',
+                ];
 
                 return [
                     'success'     => true,
                     'brand'       => 'HIOSO',
                     'olt_name'    => $this->getName(),
-                    'host'        => "{$host}:{$telnetPort}",
-                    'method_used' => 'telnet',
-                    'latency_ms'  => $latencyMs,
-                    'message'     => "Berhasil terhubung ke port Telnet CLI OLT HIOSO ({$host}:{$telnetPort}) dalam {$latencyMs} ms.",
+                    'host'        => "{$host}:{$httpPort}",
+                    'method_used' => 'http_asp (GoAhead-Webs)',
+                    'latency_ms'  => $httpTcp['latency_ms'],
+                    'message'     => "Berhasil terhubung dan login ke OLT HIOSO ({$host}:{$httpPort}" . (!empty($devInfo['model']) ? " — {$devInfo['model']} {$devInfo['fw_ver']}" : '') . "). Data ONU & redaman siap dibaca.",
+                    'steps'       => $steps,
+                    'diagnostics' => $diagnostics,
+                    'checked_at'  => $checkedAt,
+                ];
+            } catch (Exception $httpEx) {
+                $authErr = $this->lastAuthError ?? [
+                    'stage'    => 'auth',
+                    'cause'    => $httpEx->getMessage(),
+                    'solution' => 'Periksa HIOSO_USERNAME dan HIOSO_PASSWORD pada file .env.',
+                ];
+                $steps['authentication'] = [
+                    'status'    => 'failed',
+                    'username'  => $this->config['username'],
+                    'http_code' => $authErr['http_code'] ?? null,
+                    'detail'    => $authErr['cause'],
+                ];
+
+                // Jika metode adalah http (atau SNMP tidak punya tabel optik), kembalikan error autentikasi yang spesifik
+                if ($method === 'http' || !$diagnostics['snmp_reachable']) {
+                    return $fail(
+                        'Port HTTP OLT HIOSO terbuka, tetapi autentikasi/pembacaan gagal: ' . $authErr['cause'],
+                        $authErr,
+                        [
+                            $authErr['solution'] ?? 'Pastikan HIOSO_USERNAME dan HIOSO_PASSWORD sesuai dengan login Web http://' . $host . '/',
+                            'Server Web OLT menggunakan GoAhead-Webs HTTP Basic Authentication (realm="EPON-System").',
+                        ],
+                        $httpTcp['latency_ms']
+                    );
+                }
+            }
+        }
+
+        // Langkah 3 & 4 Alternatif: SNMP (jika method=snmp atau fallback auto ketika HTTP tidak digunakan)
+        if (in_array($method, ['snmp', 'auto'], true) && $diagnostics['snmp_reachable']) {
+            $steps['authentication'] = [
+                'status' => 'ok',
+                'variant' => 'snmp_v2c',
+                'detail' => "SNMP v2c merespons sysDescr ('{$diagnostics['sys_descr']}').",
+            ];
+            $profile = $this->detectSnmpProfile();
+            if ($profile !== null) {
+                $diagnostics['detected_profile'] = $this->detectedProfileName . ' (' . ($profile['description'] ?? '') . ')';
+                $steps['onu_data_fetch'] = [
+                    'status' => 'ok',
+                    'detail' => "Tabel OID ONU HIOSO ditemukan ({$this->detectedProfileName}).",
+                ];
+                return [
+                    'success'     => true,
+                    'brand'       => 'HIOSO',
+                    'olt_name'    => $this->getName(),
+                    'host'        => "{$host}:{$snmpPort}",
+                    'method_used' => "snmp ({$this->detectedProfileName})",
+                    'latency_ms'  => $ping['latency_ms'],
+                    'message'     => "Berhasil terhubung ke OLT HIOSO ({$host}) via SNMP v2c ({$this->detectedProfileName}).",
+                    'steps'       => $steps,
                     'diagnostics' => $diagnostics,
                     'checked_at'  => $checkedAt,
                 ];
             }
+
+            $steps['onu_data_fetch'] = [
+                'status' => 'failed',
+                'detail' => "SNMP hanya mengekspos MIB-2 dasar (sysDescr: '{$diagnostics['sys_descr']}'), tidak menyediakan OID redaman optik ONU pada firmware ini.",
+            ];
+            if ($method === 'snmp') {
+                return $fail(
+                    "SNMP OLT HIOSO ({$host}) aktif, tetapi firmware ini tidak menyediakan tabel OID optik ONU via SNMP.",
+                    ['stage' => 'data', 'cause' => $steps['onu_data_fetch']['detail']],
+                    ['Ubah HIOSO_METHOD=http atau HIOSO_METHOD=auto pada file .env agar menggunakan jalur Web Management GoAhead-Webs.']
+                );
+            }
         }
 
-        $diagnostics['hints'] = [
-            "Pastikan perangkat OLT HIOSO ({$host}) menyala dan terhubung ke jaringan lokal atau tunnel VPN yang sama.",
-            "Jika menggunakan SNMP (UDP Port {$this->config['snmp_port']}), pastikan fitur SNMP Agent sudah aktif di OLT dan Community ('{$this->config['snmp_community']}') sudah sesuai.",
-            "Jika menggunakan Web/Telnet, pastikan port HTTP ({$this->config['http_port']}) atau Telnet ({$this->config['telnet_port']}) dapat diakses.",
-            "Detail terakhir: {$this->lastError}",
-        ];
+        // Langkah 3 & 4 Alternatif: Telnet CLI
+        if (in_array($method, ['telnet', 'auto'], true) && $diagnostics['telnet_reachable']) {
+            $steps['authentication'] = [
+                'status'  => 'ok',
+                'variant' => 'telnet_port_open',
+                'detail'  => "Port Telnet {$telnetPort} terbuka.",
+            ];
+            return [
+                'success'     => true,
+                'brand'       => 'HIOSO',
+                'olt_name'    => $this->getName(),
+                'host'        => "{$host}:{$telnetPort}",
+                'method_used' => 'telnet',
+                'latency_ms'  => $telnetTcp['latency_ms'],
+                'message'     => "Port Telnet CLI OLT HIOSO ({$host}:{$telnetPort}) terbuka.",
+                'steps'       => $steps,
+                'diagnostics' => $diagnostics,
+                'checked_at'  => $checkedAt,
+            ];
+        }
 
-        Logger::warning('HIOSO', "Tes koneksi gagal ke OLT HIOSO ({$host})", ['method' => $method, 'last_error' => $this->lastError]);
-
-        return [
-            'success'     => false,
-            'brand'       => 'HIOSO',
-            'olt_name'    => $this->getName(),
-            'host'        => $host,
-            'method_used' => $method,
-            'latency_ms'  => null,
-            'message'     => "OLT HIOSO ({$host}) tidak dapat diakses melalui metode '{$method}'. Periksa koneksi jaringan/VPN, IP OLT, atau pengaturan SNMP/Web di .env.",
-            'diagnostics' => $diagnostics,
-            'checked_at'  => $checkedAt,
-        ];
+        return $fail(
+            "OLT HIOSO ({$host}) tidak dapat diakses melalui metode '{$method}'.",
+            $this->lastAuthError ?? ['stage' => 'connection', 'cause' => $this->lastError ?: 'Semua jalur komunikasi gagal.'],
+            [
+                "Pastikan HIOSO_HOST ({$host}), HIOSO_USERNAME, dan HIOSO_PASSWORD pada file .env sudah benar.",
+                "Coba buka http://{$host}/ di browser untuk memastikan Web Management OLT aktif.",
+            ]
+        );
     }
 
     /**
@@ -306,36 +429,48 @@ class HiosoDriver implements OltDriverInterface
                 $methodUsed = "snmp ({$this->detectedProfileName})";
             } elseif ($method === 'http') {
                 $rawRecords = $this->fetchViaHttpWeb($fetchedAt);
-                $methodUsed = 'http_asp';
+                $methodUsed = 'http_asp (GoAhead-Webs)';
             } elseif ($method === 'telnet') {
                 $rawRecords = $this->fetchViaTelnet($fetchedAt);
                 $methodUsed = 'telnet_cli';
             } else {
-                // Mode 'auto': Prioritaskan SNMP -> HTTP Web -> Telnet CLI
+                // Mode 'auto':
+                // Jika kredensial HTTP tersedia, prioritaskan HTTP Web Management (.asp GoAhead-Webs)
+                // karena model HIOSO HA7302/HA7304 mengembalikan seluruh ONU + Rx + Tx + Suhu dalam 1 request (< 100 ms),
+                // lalu fallback ke SNMP v2c dan Telnet CLI bila diperlukan.
                 $errors = [];
-                try {
-                    $rawRecords = $this->fetchViaSnmp($fetchedAt);
-                    $methodUsed = "snmp ({$this->detectedProfileName})";
-                } catch (Exception $snmpEx) {
-                    $errors['snmp'] = $snmpEx->getMessage();
-                    Logger::warning('HIOSO', 'SNMP gagal pada mode auto, mencoba fallback HTTP Web: ' . $snmpEx->getMessage());
-
+                if ($this->hasHttpCredentials()) {
                     try {
                         $rawRecords = $this->fetchViaHttpWeb($fetchedAt);
-                        $methodUsed = 'http_asp (fallback)';
+                        $methodUsed = 'http_asp (GoAhead-Webs)';
                     } catch (Exception $httpEx) {
                         $errors['http'] = $httpEx->getMessage();
-                        Logger::warning('HIOSO', 'HTTP Web gagal pada mode auto, mencoba fallback Telnet: ' . $httpEx->getMessage());
+                        // Jika gagal karena password HTTP 401 ditolak eksplisit, hentikan agar pengguna tahu password salah
+                        if (($this->lastAuthError['http_code'] ?? 0) === 401) {
+                            throw $httpEx;
+                        }
+                        Logger::warning('HIOSO', 'HTTP Web gagal pada mode auto, mencoba fallback SNMP: ' . $httpEx->getMessage());
+                    }
+                }
+
+                if (empty($rawRecords)) {
+                    try {
+                        $rawRecords = $this->fetchViaSnmp($fetchedAt);
+                        $methodUsed = "snmp ({$this->detectedProfileName})";
+                    } catch (Exception $snmpEx) {
+                        $errors['snmp'] = $snmpEx->getMessage();
+                        Logger::warning('HIOSO', 'SNMP gagal pada mode auto, mencoba fallback Telnet: ' . $snmpEx->getMessage());
 
                         try {
                             $rawRecords = $this->fetchViaTelnet($fetchedAt);
                             $methodUsed = 'telnet_cli (fallback)';
                         } catch (Exception $telEx) {
                             $errors['telnet'] = $telEx->getMessage();
-                            throw new Exception(
-                                "Gagal mengambil data OLT HIOSO ({$host}) di semua jalur komunikasi. " .
-                                "SNMP: {$errors['snmp']} | HTTP: {$errors['http']} | Telnet: {$errors['telnet']}"
-                            );
+                            $errParts = [];
+                            foreach ($errors as $k => $msg) {
+                                $errParts[] = strtoupper($k) . ": {$msg}";
+                            }
+                            throw new Exception("Gagal mengambil data OLT HIOSO ({$host}). " . implode(' | ', $errParts));
                         }
                     }
                 }
@@ -353,6 +488,8 @@ class HiosoDriver implements OltDriverInterface
                 'olt_name'          => $this->getName(),
                 'olt_host'          => $host,
                 'olt_type'          => $this->config['type'],
+                'olt_device'        => $this->deviceInfo,
+                'pon_ports_scanned' => count($this->detectedPonIds) ?: ($this->deviceInfo['pon_ports'] ?? (int)$this->config['pon_ports']),
                 'method_used'       => $methodUsed,
                 'from_cache'        => false,
                 'fetched_at'        => $fetchedAt,
@@ -377,10 +514,10 @@ class HiosoDriver implements OltDriverInterface
                 'fetched_at'        => $fetchedAt,
                 'execution_time_ms' => $elapsedMs,
                 'error'             => $e->getMessage(),
+                'failure_detail'    => $this->lastAuthError,
                 'troubleshooting'   => [
-                    'Pastikan IP OLT HIOSO (' . $host . ') dapat di-ping dari server XAMPP ini.',
-                    'Jika menggunakan SNMP, pastikan port UDP 161 terbuka dan HIOSO_SNMP_COMMUNITY di .env sesuai dengan pengaturan SNMP OLT.',
-                    'Jika menggunakan Web/Telnet, pastikan HIOSO_USERNAME dan HIOSO_PASSWORD di .env sesuai.',
+                    'Pastikan IP OLT HIOSO (' . $host . ') dapat dijangkau dari server XAMPP ini.',
+                    'Pastikan HIOSO_USERNAME dan HIOSO_PASSWORD di .env sesuai dengan login Web http://' . $host . '/.',
                     'Gunakan endpoint /api/test.php?brand=hioso untuk melihat diagnosa lengkap per protokol.',
                 ],
                 'summary'           => $emptyStats['summary'],
@@ -821,75 +958,162 @@ class HiosoDriver implements OltDriverInterface
      * METODE 2: HTTP WEB INTERFACE (.ASP) BAWAAN OLT HIOSO (HA7302/HA7304/HA7308)
      * ========================================================================
      */
+    private function httpGetGoAhead(string $path): array
+    {
+        $host    = $this->config['host'];
+        $port    = (int)$this->config['http_port'];
+        $user    = $this->config['username'];
+        $pass    = $this->config['password'];
+        $timeout = max(5, (int)$this->config['timeout']);
+        $baseUrl = ($port === 80) ? "http://{$host}" : "http://{$host}:{$port}";
+
+        $url  = $baseUrl . '/' . ltrim($path, '/');
+        $auth = 'Authorization: Basic ' . base64_encode("{$user}:{$pass}");
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_TIMEOUT        => $timeout,
+            CURLOPT_CONNECTTIMEOUT => min(6, $timeout),
+            CURLOPT_HTTPHEADER     => [
+                $auth,
+                "Referer: {$baseUrl}/",
+                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            ],
+        ]);
+
+        $body = curl_exec($ch);
+        if (curl_errno($ch)) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new Exception("Gagal menghubungi Web Management OLT HIOSO ({$baseUrl}): {$err}");
+        }
+
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $bodyStr = (string)$body;
+        if ($code === 401 || stripos($bodyStr, 'Access Denied!Please login') !== false) {
+            $this->lastAuthError = [
+                'stage'     => 'auth',
+                'http_code' => 401,
+                'cause'     => "Autentikasi HTTP Basic ke OLT HIOSO ditolak (HTTP 401): Username '{$user}' atau password salah.",
+                'solution'  => "Periksa HIOSO_USERNAME dan HIOSO_PASSWORD pada file .env dan pastikan dapat login ke {$baseUrl}/.",
+            ];
+            throw new Exception($this->lastAuthError['cause']);
+        }
+
+        return [
+            'code' => $code,
+            'body' => $bodyStr,
+        ];
+    }
+
+    /**
+     * Membaca informasi perangkat (model, firmware, jumlah port PON) dari halaman /system.asp
+     * dan daftar port PON aktif dari /onuConfigPonList.asp (read-only).
+     */
+    private function loadWebSystemInfo(): ?array
+    {
+        if ($this->deviceInfo !== null) {
+            return $this->deviceInfo;
+        }
+
+        $sysRes = $this->httpGetGoAhead('/system.asp');
+        if ($sysRes['code'] === 200 && preg_match('/var\s+sysInfo\s*=\s*new\s+Array\s*\((.*?)\)\s*;/is', $sysRes['body'], $m)) {
+            $tokens = $this->tokenizeJsArray($m[1]);
+            if (count($tokens) >= 6) {
+                $this->deviceInfo = [
+                    'sys_name' => $tokens[0] ?? null,
+                    'descr'    => $tokens[1] ?? null,
+                    'location' => $tokens[2] ?? null,
+                    'model'    => $tokens[3] ?? null,
+                    'fw_ver'   => $tokens[4] ?? null,
+                    'release'  => $tokens[5] ?? null,
+                    'mac'      => $tokens[6] ?? null,
+                    'sn'       => $tokens[7] ?? null,
+                ];
+            }
+        }
+
+        $ponRes = $this->httpGetGoAhead('/onuConfigPonList.asp');
+        if ($ponRes['code'] === 200 && preg_match('/var\s+ponListTable\s*=\s*new\s+Array\s*\((.*?)\)\s*;/is', $ponRes['body'], $pm)) {
+            $ptokens = $this->tokenizeJsArray($pm[1]);
+            $ponIds  = [];
+            foreach ($ptokens as $tok) {
+                if (preg_match('/^\d+\/\d+\/\d+$/', $tok)) {
+                    $ponIds[] = $tok;
+                }
+            }
+            if (!empty($ponIds)) {
+                $this->detectedPonIds = array_values(array_unique($ponIds));
+                if ($this->deviceInfo === null) {
+                    $this->deviceInfo = [];
+                }
+                $this->deviceInfo['pon_ports'] = count($this->detectedPonIds);
+            }
+        }
+
+        return $this->deviceInfo;
+    }
+
     private function fetchViaHttpWeb(string $fetchedAt): array
     {
         $host      = $this->config['host'];
         $port      = (int)$this->config['http_port'];
-        $user      = $this->config['username'];
-        $pass      = $this->config['password'];
         $portCount = max(1, (int)$this->config['pon_ports']);
-        $timeout   = max(5, (int)$this->config['timeout']);
+        $baseUrl   = ($port === 80) ? "http://{$host}" : "http://{$host}:{$port}";
 
-        $baseUrl    = ($port === 80) ? "http://{$host}" : "http://{$host}:{$port}";
-        $cookieFile = dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'cache' . DIRECTORY_SEPARATOR . 'hioso_web_' . md5($baseUrl) . '.cookie';
+        if (!$this->hasHttpCredentials()) {
+            $this->lastAuthError = [
+                'stage'    => 'config',
+                'cause'    => 'Kredensial Web HIOSO belum diisi pada file .env (HIOSO_USERNAME / HIOSO_PASSWORD).',
+                'solution' => 'Isi HIOSO_USERNAME dan HIOSO_PASSWORD di file .env.',
+            ];
+            throw new Exception($this->lastAuthError['cause']);
+        }
 
-        // Login ke /goform/login jika firmware menggunakan form-based session
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL            => "{$baseUrl}/goform/login",
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => http_build_query([
-                'user'     => $user,
-                'pass'     => $pass,
-                'username' => $user,
-                'password' => $pass,
-                'submit'   => 'Login',
-            ]),
-            CURLOPT_COOKIEJAR      => $cookieFile,
-            CURLOPT_COOKIEFILE     => $cookieFile,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_TIMEOUT        => $timeout,
-            CURLOPT_CONNECTTIMEOUT => min(6, $timeout),
-            CURLOPT_HTTPAUTH       => CURLAUTH_BASIC,
-            CURLOPT_USERPWD        => "{$user}:{$pass}",
-        ]);
-        @curl_exec($ch);
+        $this->lastAuthError = null;
+        $this->loadWebSystemInfo();
 
         $onuMap = [];
 
-        for ($p = 1; $p <= $portCount; $p++) {
-            $ponIdStr = "0/1/{$p}";
-
-            // Daftar halaman ASP standar yang menyimpan daftar ONU & sinyal optik pada Hioso HA7302/HA7304/HA7308
-            $candidatePages = [
-                "onuConfigPonList.asp?ponId={$ponIdStr}&pon={$p}",
-                "ponOnuList.asp?ponId={$ponIdStr}&pon={$p}",
-                "onuOpticalList.asp?ponId={$ponIdStr}&pon={$p}",
-                "onuOverviewPonList.asp?ponId={$ponIdStr}&pon={$p}",
-            ];
-
-            foreach ($candidatePages as $page) {
-                curl_setopt($ch, CURLOPT_HTTPGET, true);
-                curl_setopt($ch, CURLOPT_URL, "{$baseUrl}/{$page}");
-                $html = curl_exec($ch);
-                $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-                if ($html === false || $code >= 400 || empty($html)) {
-                    continue;
-                }
-
-                $this->parseHiosoAspHtml((string)$html, $p, $onuMap);
-            }
+        // Prioritas 1: Halaman gabungan seluruh PON (/onuAllPonOnuList.asp pada HA7302CST/HA7304/HA7308)
+        // Menyediakan seluruh ONU + Nama + MAC/SN + Status + Suhu + TxPower + RxPower + RTT + Waktu Down dalam 1 request
+        $allRes = $this->httpGetGoAhead('/onuAllPonOnuList.asp');
+        if ($allRes['code'] === 200 && $allRes['body'] !== '') {
+            $this->parseHiosoAspHtml($allRes['body'], 1, $onuMap);
         }
 
-        curl_close($ch);
-        if (is_file($cookieFile)) {
-            @unlink($cookieFile);
-        }
-
+        // Prioritas 2: Jika halaman gabungan kosong/tidak didukung firmware, pindai per port PON
         if (empty($onuMap)) {
-            throw new Exception("Tidak ditemukan data ONU dari halaman Web Management OLT HIOSO ({$baseUrl}). Pastikan kredensial Web benar atau gunakan metode SNMP.");
+            $ponIds = !empty($this->detectedPonIds) ? $this->detectedPonIds : [];
+            if (empty($ponIds)) {
+                for ($p = 1; $p <= $portCount; $p++) {
+                    $ponIds[] = "0/1/{$p}";
+                }
+            }
+
+            foreach ($ponIds as $idx => $ponIdStr) {
+                $ponNum = $idx + 1;
+                if (preg_match('/\/(\d+)$/', $ponIdStr, $pm)) {
+                    $ponNum = (int)$pm[1];
+                }
+                $candidatePages = [
+                    'onuConfigOnuList.asp?oltponno=' . rawurlencode($ponIdStr),
+                    "ponOnuList.asp?ponId={$ponIdStr}&pon={$ponNum}",
+                    "onuOpticalList.asp?ponId={$ponIdStr}&pon={$ponNum}",
+                    "onuOverviewPonList.asp?ponId={$ponIdStr}&pon={$ponNum}",
+                ];
+
+                foreach ($candidatePages as $page) {
+                    $res = $this->httpGetGoAhead('/' . $page);
+                    if ($res['code'] === 200 && $res['body'] !== '') {
+                        $this->parseHiosoAspHtml($res['body'], $ponNum, $onuMap);
+                    }
+                }
+            }
         }
 
         $records = [];
@@ -907,66 +1131,207 @@ class HiosoDriver implements OltDriverInterface
     }
 
     /**
-     * Mem-parsing halaman ASP Hioso (mendukung format JS Array maupun tabel HTML).
+     * Memecah isi literal JavaScript new Array(...) menjadi daftar nilai bersih,
+     * mengabaikan komentar // atau /* ... *\/ di dalam script ASP Hioso.
+     *
+     * @return string[]
+     */
+    private function tokenizeJsArray(string $inside): array
+    {
+        // Hapus komentar blok /* ... */ dan komentar baris // di luar tanda kutip
+        $clean = (string)preg_replace('#/\*.*?\*/#s', '', $inside);
+        $clean = (string)preg_replace('/^\s*\/\/.*$/m', '', $clean);
+
+        $tokens = [];
+        $len    = strlen($clean);
+        $i      = 0;
+
+        while ($i < $len) {
+            // Lewati spasi dan koma pemisah
+            while ($i < $len && ($clean[$i] === ' ' || $clean[$i] === "\t" || $clean[$i] === "\r" || $clean[$i] === "\n" || $clean[$i] === ',')) {
+                $i++;
+            }
+            if ($i >= $len) {
+                break;
+            }
+
+            // Komentar // inline setelah koma
+            if ($clean[$i] === '/' && ($i + 1 < $len) && $clean[$i + 1] === '/') {
+                while ($i < $len && $clean[$i] !== "\n") {
+                    $i++;
+                }
+                continue;
+            }
+
+            $ch = $clean[$i];
+            if ($ch === "'" || $ch === '"') {
+                $quote = $ch;
+                $i++;
+                $buf = '';
+                while ($i < $len && $clean[$i] !== $quote) {
+                    if ($clean[$i] === '\\' && ($i + 1) < $len) {
+                        $i++;
+                    }
+                    $buf .= $clean[$i];
+                    $i++;
+                }
+                if ($i < $len && $clean[$i] === $quote) {
+                    $i++;
+                }
+                $tokens[] = trim($buf);
+            } else {
+                $buf = '';
+                while ($i < $len && $clean[$i] !== ',' && $clean[$i] !== "\r" && $clean[$i] !== "\n") {
+                    $buf .= $clean[$i];
+                    $i++;
+                }
+                $val = trim($buf);
+                if ($val !== '') {
+                    $tokens[] = $val;
+                }
+            }
+        }
+
+        return $tokens;
+    }
+
+    /**
+     * Mem-parsing halaman ASP Hioso (mendukung format JS Array multi-baris onutable / ponOnuTable
+     * maupun tabel HTML standar).
      */
     private function parseHiosoAspHtml(string $html, int $defaultPon, array &$onuMap): void
     {
-        // Format 1: Firmware Hioso menyematkan data di dalam Array JavaScript
-        // Contoh: new Array("0/1/1:1", "NAMA_ONU", "00:11:22:33:44:55", "up", "-21.45", "1.82", ...)
-        if (preg_match_all('/(?:new\s+Array|\[)\s*\(([^)]+)\)/i', $html, $arrMatches)) {
+        // Format 1: Array JavaScript Hioso (onutable stride 18 di onuAllPonOnuList.asp,
+        // ponOnuTable stride 13 di onuConfigOnuList.asp, atau array per-ONU)
+        if (preg_match_all('/new\s+Array\s*\((.*?)\)\s*;/is', $html, $arrMatches)) {
             foreach ($arrMatches[1] as $inside) {
-                $tokens = str_getcsv($inside, ',', "'");
-                if (count($tokens) < 3) {
-                    $tokens = str_getcsv($inside, ',', '"');
+                $tokens = $this->tokenizeJsArray($inside);
+                $count  = count($tokens);
+                if ($count < 4) {
+                    continue;
                 }
-                $tokens = array_map(static fn($t) => trim((string)$t, " \t\n\r\0\x0B\"'"), $tokens);
 
-                foreach ($tokens as $idx => $tok) {
-                    if (preg_match('/^(?:0\/\d+\/)?(\d+):(\d+)$/', $tok, $idMatch)) {
-                        $pon    = (int)$idMatch[1];
-                        $onuNum = (int)$idMatch[2];
-                        $onuId  = "0/1/{$pon}:{$onuNum}";
-
-                        $mac    = null;
-                        $status = null;
-                        $floats = [];
-                        $name   = null;
-
-                        for ($j = $idx + 1; $j < count($tokens); $j++) {
-                            $val = $tokens[$j];
-                            if ($mac === null && preg_match('/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/', $val)) {
-                                $mac = strtoupper(str_replace('-', ':', $val));
-                            } elseif ($status === null && preg_match('/^(up|down|online|offline|auth\w*|registered|deregistered)$/i', $val)) {
-                                $status = $val;
-                            } elseif (preg_match('/^[-+]?\d+\.\d+$/', $val)) {
-                                $floats[] = (float)$val;
-                            } elseif ($name === null && strlen($val) > 1 && !is_numeric($val)) {
-                                $name = $val;
-                            }
-                        }
-
-                        $rx = null;
-                        $tx = null;
-                        foreach ($floats as $f) {
-                            if ($rx === null && $f < -3.0 && $f > -45.0) {
-                                $rx = $f;
-                            } elseif ($tx === null && $f >= -3.0 && $f <= 10.0) {
-                                $tx = $f;
-                            }
-                        }
-
-                        $onuMap[$onuId] = array_merge($onuMap[$onuId] ?? [], array_filter([
-                            'onu_id'     => $onuId,
-                            'onu_index'  => "1.{$pon}.{$onuNum}",
-                            'pon_port'   => (string)$pon,
-                            'onu_number' => $onuNum,
-                            'onu_name'   => $name,
-                            'sn'         => $mac,
-                            'status'     => $status,
-                            'rx_power'   => $rx,
-                            'tx_power'   => $tx,
-                        ], static fn($v) => $v !== null && $v !== ''));
+                // Temukan seluruh posisi awal baris ONU berdasarkan pola ID "0/1/1:1" atau "1:1"
+                $rowStarts = [];
+                for ($idx = 0; $idx < $count; $idx++) {
+                    if (preg_match('/^(?:(\d+\/\d+)\/)?(\d+):(\d+)$/', $tokens[$idx])) {
+                        $rowStarts[] = $idx;
                     }
+                }
+
+                $numRows = count($rowStarts);
+                for ($r = 0; $r < $numRows; $r++) {
+                    $start = $rowStarts[$r];
+                    $end   = ($r + 1 < $numRows) ? $rowStarts[$r + 1] : $count;
+                    $row   = array_slice($tokens, $start, $end - $start);
+                    $rLen  = count($row);
+
+                    if (!preg_match('/^(?:(\d+\/\d+)\/)?(\d+):(\d+)$/', $row[0], $idMatch)) {
+                        continue;
+                    }
+
+                    $slot   = ($idMatch[1] !== '') ? $idMatch[1] : '0/1';
+                    $pon    = (int)$idMatch[2];
+                    $onuNum = (int)$idMatch[3];
+                    $onuId  = "{$slot}/{$pon}:{$onuNum}";
+
+                    // Struktur resmi Hioso GoAhead-Webs (onutable = 18 kolom, ponOnuTable = 13 kolom):
+                    // [0]=Id, [1]=Name, [2]=MacAddress, [3]=Status(Up/PwrDown/Down), [4]=Version,
+                    // [5]=ChipId, [6]=Ports, [7]=Temperature, [8]=Voltage, [9]=BiasCurrent,
+                    // [10]=TxPower(dBm), [11]=RxPower(dBm), ...
+                    if ($rLen >= 12 && preg_match('/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/', $row[2])) {
+                        $name   = $row[1] !== '' ? $row[1] : "ONU-{$onuId}";
+                        $mac    = strtoupper(str_replace('-', ':', $row[2]));
+                        $status = $row[3] !== '' ? $row[3] : 'Offline';
+                        $ver    = $row[4] ?? '';
+                        $chip   = $row[5] ?? '';
+                        $temp   = is_numeric($row[7]) ? (float)$row[7] : null;
+                        $tx     = is_numeric($row[10]) ? (float)$row[10] : $row[10];
+                        $rx     = is_numeric($row[11]) ? (float)$row[11] : $row[11];
+
+                        $model      = ($chip !== '' && $chip !== '0000') ? "Chip-{$chip}" . ($ver !== '' ? " (v{$ver})" : '') : null;
+                        $downReason = null;
+                        $downTime   = null;
+                        $distanceM  = null;
+
+                        if ($rLen >= 18) {
+                            $reasonStr  = ((string)$row[14] === '1') ? 'Dying_gasp' : 'Timeout';
+                            $downReason = (strtolower($status) !== 'up') ? "{$status} ({$reasonStr})" : $reasonStr;
+                            $rtt        = is_numeric($row[15]) ? (int)$row[15] : null;
+                            if ($rtt !== null && $rtt > 0) {
+                                $calcDist  = (int)round(($rtt * 1.6393) - 157);
+                                $distanceM = max(1, $calcDist);
+                            }
+                            $downTime = $row[17] ?? null;
+                        } elseif ($rLen >= 13 && is_numeric($row[12])) {
+                            $rtt = (int)$row[12];
+                            if ($rtt > 0) {
+                                $distanceM = max(1, (int)round(($rtt * 1.6393) - 157));
+                            }
+                        }
+
+                        $onuMap[$onuId] = [
+                            'onu_id'           => $onuId,
+                            'onu_index'        => "1.{$pon}.{$onuNum}",
+                            'slot'             => $slot,
+                            'pon_port'         => (string)$pon,
+                            'onu_number'       => $onuNum,
+                            'onu_name'         => $name,
+                            'sn'               => $mac,
+                            'mac_address'      => $mac,
+                            'status'           => $status,
+                            'rx_power'         => $rx,
+                            'tx_power'         => $tx,
+                            'temperature_c'    => $temp,
+                            'distance_m'       => $distanceM,
+                            'model'            => $model,
+                            'last_down_reason' => $downReason,
+                            'last_down_time'   => $downTime,
+                        ];
+                        continue;
+                    }
+
+                    // Fallback generik untuk array ringkas (mis. 6 kolom: Id, Name, MAC, Status, Rx, Tx)
+                    $mac    = null;
+                    $status = null;
+                    $floats = [];
+                    $name   = null;
+
+                    for ($j = 1; $j < $rLen; $j++) {
+                        $val = $row[$j];
+                        if ($mac === null && preg_match('/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/', $val)) {
+                            $mac = strtoupper(str_replace('-', ':', $val));
+                        } elseif ($status === null && preg_match('/^(up|down|pwrdown|wiredown|los|online|offline|auth\w*|registered|deregistered)$/i', $val)) {
+                            $status = $val;
+                        } elseif (preg_match('/^[-+]?\d+\.\d+$/', $val)) {
+                            $floats[] = (float)$val;
+                        } elseif ($name === null && strlen($val) > 1 && !is_numeric($val)) {
+                            $name = $val;
+                        }
+                    }
+
+                    $rx = null;
+                    $tx = null;
+                    foreach ($floats as $f) {
+                        if ($rx === null && $f < -3.0 && $f > -45.0) {
+                            $rx = $f;
+                        } elseif ($tx === null && $f >= -3.0 && $f <= 10.0) {
+                            $tx = $f;
+                        }
+                    }
+
+                    $onuMap[$onuId] = array_merge($onuMap[$onuId] ?? [], array_filter([
+                        'onu_id'     => $onuId,
+                        'onu_index'  => "1.{$pon}.{$onuNum}",
+                        'slot'       => $slot,
+                        'pon_port'   => (string)$pon,
+                        'onu_number' => $onuNum,
+                        'onu_name'   => $name,
+                        'sn'         => $mac,
+                        'status'     => $status,
+                        'rx_power'   => $rx,
+                        'tx_power'   => $tx,
+                    ], static fn($v) => $v !== null && $v !== ''));
                 }
             }
         }
@@ -983,10 +1348,11 @@ class HiosoDriver implements OltDriverInterface
                 }
 
                 foreach ($cells as $cIdx => $cell) {
-                    if (preg_match('/^(?:0\/\d+\/)?(\d+):(\d+)$/', $cell, $idMatch)) {
-                        $pon    = (int)$idMatch[1];
-                        $onuNum = (int)$idMatch[2];
-                        $onuId  = "0/1/{$pon}:{$onuNum}";
+                    if (preg_match('/^(?:(\d+\/\d+)\/)?(\d+):(\d+)$/', $cell, $idMatch)) {
+                        $slot   = ($idMatch[1] !== '') ? $idMatch[1] : '0/1';
+                        $pon    = (int)$idMatch[2];
+                        $onuNum = (int)$idMatch[3];
+                        $onuId  = "{$slot}/{$pon}:{$onuNum}";
 
                         $mac    = null;
                         $status = null;
@@ -1000,7 +1366,7 @@ class HiosoDriver implements OltDriverInterface
                             }
                             if ($mac === null && preg_match('/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/', $val)) {
                                 $mac = strtoupper(str_replace('-', ':', $val));
-                            } elseif ($status === null && preg_match('/^(up|down|online|offline|working)$/i', $val)) {
+                            } elseif ($status === null && preg_match('/^(up|down|pwrdown|online|offline|working)$/i', $val)) {
                                 $status = $val;
                             } elseif (preg_match('/[-+]?\d+\.\d+/', $val, $fm)) {
                                 $f = (float)$fm[0];
@@ -1017,6 +1383,7 @@ class HiosoDriver implements OltDriverInterface
                         $onuMap[$onuId] = array_merge($onuMap[$onuId] ?? [], array_filter([
                             'onu_id'     => $onuId,
                             'onu_index'  => "1.{$pon}.{$onuNum}",
+                            'slot'       => $slot,
                             'pon_port'   => (string)$pon,
                             'onu_number' => $onuNum,
                             'onu_name'   => $name ?? ($onuMap[$onuId]['onu_name'] ?? "ONU-{$onuId}"),

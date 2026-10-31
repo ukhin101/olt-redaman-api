@@ -6,6 +6,7 @@ use Exception;
 use OltRedaman\Config\EnvLoader;
 use OltRedaman\Contracts\OltDriverInterface;
 use OltRedaman\Support\Logger;
+use OltRedaman\Support\NetworkProbe;
 use OltRedaman\Support\OnuDataNormalizer;
 
 /**
@@ -34,6 +35,16 @@ class HsgqDriver implements OltDriverInterface
     private ?string $token = null;
     private string $cookieFile;
     private string $authVariantUsed = 'none';
+    private int $lastHttpCode = 0;
+
+    /** @var array|null Informasi perangkat dari endpoint board_info (model, firmware, jumlah PON) */
+    private ?array $boardInfo = null;
+
+    /** @var array<string, bool> Endpoint yang terbukti tidak didukung firmware (HTTP 404) */
+    private array $unsupportedEndpoints = [];
+
+    /** @var array|null Detail kegagalan login terakhir (tanpa password) */
+    private ?array $lastAuthError = null;
 
     public function __construct(array $configOverrides = [])
     {
@@ -64,8 +75,12 @@ class HsgqDriver implements OltDriverInterface
     }
 
     /**
-     * Menguji koneksi ke OLT HSGQ, memeriksa port jaringan, autentikasi login,
-     * serta memvalidasi ketersediaan pembacaan redaman optik.
+     * Menguji koneksi ke OLT HSGQ secara bertahap (read-only):
+     *  1. Keterjangkauan IP (ICMP ping)
+     *  2. Akses port (TCP HTTP / Telnet)
+     *  3. Autentikasi (login Web JSON API HSGQ)
+     *  4. Pengambilan data ONU/ONT + validasi Rx Power (opsional, dilakukan di Manager)
+     * Password tidak pernah ditampilkan dalam hasil diagnostik.
      */
     public function testConnection(): array
     {
@@ -73,71 +88,96 @@ class HsgqDriver implements OltDriverInterface
         $host      = $this->config['host'];
         $method    = $this->config['method'];
         $port      = ($method === 'telnet') ? (int)$this->config['telnet_port'] : (int)$this->config['port'];
+        $timeout   = min(5, max(2, (int)$this->config['timeout']));
 
+        $steps = [
+            'ip_reachability' => ['status' => 'skipped'],
+            'port_access'     => ['status' => 'skipped'],
+            'authentication'  => ['status' => 'skipped'],
+            'onu_data_fetch'  => ['status' => 'skipped'],
+        ];
         $diagnostics = [
             'configured_enabled' => (bool)$this->config['enabled'],
             'host'               => $host,
             'port'               => $port,
             'method_configured'  => $method,
+            'username'           => $this->config['username'],
+            'password_set'       => $this->config['password'] !== '' && $this->config['password'] !== 'your_hsgq_password_here',
             'olt_type'           => $this->config['type'],
-            'pon_ports'          => $this->config['pon_ports'],
             'tcp_reachable'      => false,
             'authenticated'      => false,
             'auth_variant'       => null,
-            'sample_port_read'   => false,
+            'olt_device'         => null,
             'hints'              => [],
         ];
 
+        $fail = function (string $message, ?array $cause, array $hints) use (&$steps, &$diagnostics, $host, $port, $method, $checkedAt) {
+            $diagnostics['hints'] = $hints;
+            return [
+                'success'        => false,
+                'brand'          => 'HSGQ',
+                'olt_name'       => $this->getName(),
+                'host'           => "{$host}:{$port}",
+                'method_used'    => $method,
+                'latency_ms'     => $steps['port_access']['latency_ms'] ?? null,
+                'message'        => $message,
+                'failure_cause'  => $cause,
+                'steps'          => $steps,
+                'diagnostics'    => $diagnostics,
+                'checked_at'     => $checkedAt,
+            ];
+        };
+
+        if (!$this->config['enabled']) {
+            return $fail('Modul OLT HSGQ dinonaktifkan (HSGQ_ENABLED=false).', ['stage' => 'config', 'cause' => 'Modul dinonaktifkan di .env.'], []);
+        }
         if (empty($host)) {
-            return [
-                'success'     => false,
-                'brand'       => 'HSGQ',
-                'olt_name'    => $this->getName(),
-                'host'        => '(kosong)',
-                'method_used' => $method,
-                'latency_ms'  => null,
-                'message'     => 'Alamat IP / Host OLT HSGQ belum diatur pada file .env (HSGQ_HOST).',
-                'diagnostics' => $diagnostics,
-                'checked_at'  => $checkedAt,
-            ];
+            return $fail('Alamat IP / Host OLT HSGQ belum diatur pada file .env (HSGQ_HOST).', ['stage' => 'config', 'cause' => 'HSGQ_HOST kosong.'], []);
         }
 
-        // Langkah 1: Uji keterjangkauan soket TCP
-        $t0 = microtime(true);
-        $fp = @fsockopen($host, $port, $errno, $errstr, min(5, max(2, (int)$this->config['timeout'])));
-        $latencyMs = round((microtime(true) - $t0) * 1000, 2);
+        // Langkah 1: Keterjangkauan IP (ICMP) — informatif, karena ICMP bisa diblokir
+        $ping = NetworkProbe::ping($host);
+        $steps['ip_reachability'] = [
+            'status'     => $ping['reachable'] === true ? 'ok' : ($ping['reachable'] === false ? 'failed' : 'unknown'),
+            'latency_ms' => $ping['latency_ms'],
+            'detail'     => $ping['note'],
+        ];
 
-        if (!$fp) {
-            $diagnostics['hints'] = [
-                "Pastikan perangkat OLT HSGQ ({$host}) menyala dan terhubung ke jaringan/VPN yang sama dengan komputer XAMPP ini.",
-                "Periksa apakah port akses HSGQ ({$port}) sudah benar di file .env (standar HTTP: 80, atau port forwarding seperti 9154).",
-                "Detail error soket: [{$errno}] {$errstr}",
-            ];
+        // Langkah 2: Akses port TCP
+        $tcp = NetworkProbe::tcp($host, $port, $timeout);
+        $steps['port_access'] = [
+            'status'     => $tcp['open'] ? 'ok' : 'failed',
+            'port'       => $port,
+            'protocol'   => $method === 'telnet' ? 'telnet' : 'http',
+            'latency_ms' => $tcp['latency_ms'],
+            'detail'     => $tcp['open'] ? "Port TCP {$port} terbuka." : $tcp['error'],
+        ];
 
-            Logger::warning('HSGQ', "Tes koneksi gagal (TCP unreachable) ke {$host}:{$port}", ['errno' => $errno, 'errstr' => $errstr]);
-
-            return [
-                'success'     => false,
-                'brand'       => 'HSGQ',
-                'olt_name'    => $this->getName(),
-                'host'        => "{$host}:{$port}",
-                'method_used' => $method,
-                'latency_ms'  => null,
-                'message'     => "OLT HSGQ ({$host}:{$port}) tidak dapat dijangkau. Port tertutup atau jaringan/VPN terputus.",
-                'diagnostics' => $diagnostics,
-                'checked_at'  => $checkedAt,
-            ];
+        if (!$tcp['open']) {
+            Logger::warning('HSGQ', "Tes koneksi gagal (TCP) ke {$host}:{$port}", ['error' => $tcp['error']]);
+            $cause = $ping['reachable'] === true
+                ? "IP {$host} hidup, tetapi port {$port} tidak dapat diakses: {$tcp['error']}"
+                : "IP {$host} tidak menjawab ping dan port {$port} tidak dapat diakses: {$tcp['error']}";
+            return $fail(
+                "OLT HSGQ ({$host}:{$port}) tidak dapat dijangkau.",
+                ['stage' => 'network', 'cause' => $cause],
+                [
+                    "Pastikan OLT HSGQ ({$host}) menyala dan terhubung ke jaringan/VPN yang sama dengan server XAMPP.",
+                    "Pastikan HSGQ_PORT ({$port}) adalah port Web Management OLT (standar 80, atau port forwarding).",
+                    'Coba buka http://' . $host . ($port !== 80 ? ":{$port}" : '') . '/ di browser dari komputer ini.',
+                ]
+            );
         }
-        fclose($fp);
         $diagnostics['tcp_reachable'] = true;
 
-        // Langkah 2: Uji autentikasi & pembacaan sampel port 1
+        // Langkah 3: Autentikasi
         try {
             if ($method === 'telnet') {
                 $output = $this->executeTelnetCommands(['show onu-info all']);
-                $diagnostics['authenticated']    = true;
-                $diagnostics['auth_variant']     = 'telnet_cli';
-                $diagnostics['sample_port_read'] = strlen($output) > 10;
+                $diagnostics['authenticated'] = true;
+                $diagnostics['auth_variant']  = 'telnet_cli';
+                $steps['authentication'] = ['status' => 'ok', 'variant' => 'telnet_cli', 'detail' => 'Login Telnet CLI berhasil.'];
+                $steps['onu_data_fetch'] = ['status' => strlen($output) > 10 ? 'ok' : 'failed', 'detail' => 'Output CLI ' . strlen($output) . ' byte.'];
 
                 return [
                     'success'     => true,
@@ -145,62 +185,90 @@ class HsgqDriver implements OltDriverInterface
                     'olt_name'    => $this->getName(),
                     'host'        => "{$host}:{$port}",
                     'method_used' => 'telnet',
-                    'latency_ms'  => $latencyMs,
-                    'message'     => "Terhubung ke OLT HSGQ ({$host}:{$port}) via Telnet CLI ({$latencyMs} ms).",
+                    'latency_ms'  => $tcp['latency_ms'],
+                    'message'     => "Terhubung ke OLT HSGQ ({$host}:{$port}) via Telnet CLI.",
+                    'steps'       => $steps,
                     'diagnostics' => $diagnostics,
                     'checked_at'  => $checkedAt,
                 ];
             }
 
-            // Default HTTP Web JSON API
             $this->loginHttp();
-            $diagnostics['authenticated'] = true;
-            $diagnostics['auth_variant']  = $this->authVariantUsed;
-
-            $ts = round(microtime(true) * 1000);
-            $sampleList = $this->httpRequest("onu_list?port_id=1&_={$ts}");
-            if (!isset($sampleList['data'])) {
-                $sampleList = $this->httpRequest("onu_allow_list?port_id=1&_={$ts}");
-            }
-            $sampleOpt = $this->httpRequest("onu_optical_info?port_id=1&_={$ts}");
-
-            $hasDataArray = (isset($sampleList['data']) && is_array($sampleList['data']))
-                         || (isset($sampleOpt['data']) && is_array($sampleOpt['data']));
-            $diagnostics['sample_port_read'] = $hasDataArray;
-            $diagnostics['port_1_onu_count'] = isset($sampleList['data']) && is_array($sampleList['data']) ? count($sampleList['data']) : 0;
-
-            return [
-                'success'     => true,
-                'brand'       => 'HSGQ',
-                'olt_name'    => $this->getName(),
-                'host'        => "{$host}:{$port}",
-                'method_used' => "http ({$this->authVariantUsed})",
-                'latency_ms'  => $latencyMs,
-                'message'     => "Berhasil terhubung dan login ke OLT HSGQ ({$host}:{$port}) dalam {$latencyMs} ms. Endpoint optik siap digunakan.",
-                'diagnostics' => $diagnostics,
-                'checked_at'  => $checkedAt,
-            ];
         } catch (Exception $e) {
-            $diagnostics['hints'] = [
-                'Port TCP terbuka, namun proses login atau pembacaan API gagal.',
-                'Periksa kembali HSGQ_USERNAME dan HSGQ_PASSWORD pada file .env.',
-                'Pastikan akun tersebut dapat login ke halaman Web Management OLT HSGQ.',
+            $authErr = $this->lastAuthError ?? ['stage' => 'auth', 'cause' => $e->getMessage(), 'solution' => 'Periksa kredensial HSGQ di .env.'];
+            $steps['authentication'] = [
+                'status'      => 'failed',
+                'username'    => $this->config['username'],
+                'olt_code'    => $authErr['olt_code'] ?? null,
+                'olt_message' => $authErr['olt_message'] ?? null,
+                'detail'      => $authErr['cause'],
             ];
-
             Logger::error('HSGQ', 'Tes autentikasi gagal: ' . $e->getMessage(), ['host' => $host, 'port' => $port]);
 
-            return [
-                'success'     => false,
-                'brand'       => 'HSGQ',
-                'olt_name'    => $this->getName(),
-                'host'        => "{$host}:{$port}",
-                'method_used' => $method,
-                'latency_ms'  => $latencyMs,
-                'message'     => 'Koneksi jaringan ke OLT HSGQ terbuka, tetapi autentikasi gagal: ' . $e->getMessage(),
-                'diagnostics' => $diagnostics,
-                'checked_at'  => $checkedAt,
-            ];
+            return $fail(
+                'Koneksi jaringan ke OLT HSGQ terbuka, tetapi autentikasi gagal: ' . $authErr['cause'],
+                $authErr,
+                array_values(array_filter([
+                    $authErr['solution'] ?? null,
+                    'Mekanisme login yang dipakai: POST /userlogin?form=login (key=md5("user:pass"), value=base64(pass), sesi via header X-Token).',
+                    'Uji login manual di browser: http://' . $host . ($port !== 80 ? ":{$port}" : '') . '/ dengan akun yang sama.',
+                ]))
+            );
         }
+
+        $diagnostics['authenticated'] = true;
+        $diagnostics['auth_variant']  = $this->authVariantUsed;
+        $steps['authentication'] = [
+            'status'   => 'ok',
+            'username' => $this->config['username'],
+            'variant'  => $this->authVariantUsed,
+            'detail'   => 'Login Web API HSGQ berhasil (token sesi X-Token diterima).',
+        ];
+
+        // Langkah 4: Sampel pembacaan ONU (port PON 1)
+        try {
+            $diagnostics['olt_device'] = $this->loadBoardInfo();
+            $ts     = round(microtime(true) * 1000);
+            $sample = $this->requestDataEndpoint('onu_allow_list', "port_id=1&_={$ts}");
+            if (!isset($sample['data']) || !is_array($sample['data'])) {
+                $sample = $this->requestDataEndpoint('onu_list', "port_id=1&_={$ts}");
+            }
+
+            if (isset($sample['data']) && is_array($sample['data'])) {
+                $steps['onu_data_fetch'] = [
+                    'status'           => 'ok',
+                    'pon_ports'        => $this->getEffectivePonPorts(),
+                    'port_1_onu_count' => count($sample['data']),
+                    'detail'           => 'Daftar ONU port PON 1 berhasil dibaca.',
+                ];
+            } else {
+                $steps['onu_data_fetch'] = [
+                    'status' => 'failed',
+                    'detail' => 'Login berhasil tetapi endpoint daftar ONU (onu_allow_list / onu_list) tidak mengembalikan data. HTTP ' . $this->lastHttpCode . '.',
+                ];
+                return $fail(
+                    'Login OLT HSGQ berhasil, tetapi daftar ONU tidak dapat dibaca.',
+                    ['stage' => 'data', 'cause' => $steps['onu_data_fetch']['detail']],
+                    ['Pastikan akun ' . $this->config['username'] . ' memiliki hak akses membaca daftar ONU di OLT.']
+                );
+            }
+        } catch (Exception $e) {
+            $steps['onu_data_fetch'] = ['status' => 'failed', 'detail' => $e->getMessage()];
+            return $fail('Login OLT HSGQ berhasil, tetapi pembacaan ONU gagal.', ['stage' => 'data', 'cause' => $e->getMessage()], []);
+        }
+
+        return [
+            'success'     => true,
+            'brand'       => 'HSGQ',
+            'olt_name'    => $this->getName(),
+            'host'        => "{$host}:{$port}",
+            'method_used' => "http ({$this->authVariantUsed})",
+            'latency_ms'  => $tcp['latency_ms'],
+            'message'     => "Berhasil terhubung dan login ke OLT HSGQ ({$host}:{$port}). Daftar ONU dapat dibaca.",
+            'steps'       => $steps,
+            'diagnostics' => $diagnostics,
+            'checked_at'  => $checkedAt,
+        ];
     }
 
     /**
@@ -263,9 +331,11 @@ class HsgqDriver implements OltDriverInterface
                 'brand'             => 'HSGQ',
                 'olt_name'          => $this->getName(),
                 'olt_host'          => "{$host}:{$port}",
-                'olt_type'          => $this->config['type'],
-                'pon_ports_scanned' => (int)$this->config['pon_ports'],
-                'method_used'       => $methodUsed,
+                'olt_type'              => $this->config['type'],
+                'olt_device'            => $this->boardInfo,
+                'pon_ports_scanned'     => $method === 'telnet' ? (int)$this->config['pon_ports'] : $this->getEffectivePonPorts(),
+                'unsupported_endpoints' => array_keys($this->unsupportedEndpoints),
+                'method_used'           => $methodUsed,
                 'from_cache'        => false,
                 'fetched_at'        => $fetchedAt,
                 'execution_time_ms' => $elapsedMs,
@@ -289,6 +359,7 @@ class HsgqDriver implements OltDriverInterface
                 'fetched_at'        => $fetchedAt,
                 'execution_time_ms' => $elapsedMs,
                 'error'             => $e->getMessage(),
+                'failure_detail'    => $this->lastAuthError,
                 'troubleshooting'   => [
                     'Pastikan IP OLT HSGQ (' . $host . ') dan Port (' . $port . ') dapat diakses dari server XAMPP ini.',
                     'Pastikan HSGQ_USERNAME dan HSGQ_PASSWORD di file .env sudah sesuai dengan login Web OLT.',
@@ -361,9 +432,11 @@ class HsgqDriver implements OltDriverInterface
         if (curl_errno($ch)) {
             $err = curl_error($ch);
             curl_close($ch);
+            $this->lastHttpCode = 0;
             throw new Exception("Gagal menghubungi HTTP API OLT HSGQ ({$this->config['host']}:{$this->config['port']}): {$err}");
         }
 
+        $this->lastHttpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $headerSize     = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         $headerResponse = substr((string)$response, 0, $headerSize);
         $body           = substr((string)$response, $headerSize);
@@ -386,12 +459,24 @@ class HsgqDriver implements OltDriverInterface
         if (is_file($this->cookieFile)) {
             @unlink($this->cookieFile);
         }
-        $this->token = null;
+        $this->token         = null;
+        $this->lastAuthError = null;
 
         $user = $this->config['username'];
         $pass = $this->config['password'];
 
-        // Varian 1: Standar Firmware HSGQ Web JSON API (userlogin?form=login)
+        if ($user === '' || $pass === '' || $pass === 'your_hsgq_password_here') {
+            $this->lastAuthError = [
+                'stage'    => 'config',
+                'cause'    => 'Kredensial HSGQ belum diisi pada file .env (HSGQ_USERNAME / HSGQ_PASSWORD).',
+                'solution' => 'Isi HSGQ_USERNAME dan HSGQ_PASSWORD dengan akun login Web OLT HSGQ.',
+            ];
+            throw new Exception($this->lastAuthError['cause']);
+        }
+
+        // Varian 1: Firmware HSGQ Web JSON API (userlogin?form=login)
+        // Mekanisme diverifikasi dari JS login Web HSGQ: key = md5("user:pass"), value = base64(pass),
+        // token sesi dikembalikan lewat header "X-Token" dan wajib dikirim ulang di setiap request.
         $payload = [
             'method' => 'set',
             'param'  => [
@@ -404,16 +489,24 @@ class HsgqDriver implements OltDriverInterface
         ];
 
         $res = $this->httpRequest('userlogin?form=login', $payload);
-        if (isset($res['code']) && in_array($res['code'], [1, 200], true)) {
+        if (isset($res['code']) && in_array((int)$res['code'], [1, 200], true)) {
             $this->authVariantUsed = 'userlogin_json';
             return true;
         }
 
-        // Varian 2: Firmware HSGQ CGI Lama (login.cgi)
+        // Jika firmware sudah menjawab endpoint userlogin dengan kode error JSON, berarti mekanisme
+        // login sudah benar namun kredensial ditolak. Jangan mencoba varian lain agar tidak
+        // menambah percobaan login gagal (menghindari lockout akun di OLT).
+        if (is_array($res) && isset($res['code'])) {
+            $this->lastAuthError = $this->explainLoginError((int)$res['code'], trim((string)($res['message'] ?? $res['msg'] ?? '')));
+            throw new Exception("Login ke OLT HSGQ gagal: {$this->lastAuthError['cause']} (kode OLT {$res['code']}: \"{$this->lastAuthError['olt_message']}\")");
+        }
+
+        // Varian 2: Firmware HSGQ CGI Lama (login.cgi) — hanya bila endpoint userlogin tidak tersedia
         $resCgi = $this->httpRequest(
             'login.cgi?username=' . rawurlencode($user) . '&password=' . rawurlencode($pass) . '&method=login'
         );
-        if (isset($resCgi['code']) && in_array($resCgi['code'], [1, 200], true)) {
+        if (isset($resCgi['code']) && in_array((int)$resCgi['code'], [1, 200], true)) {
             $this->authVariantUsed = 'login_cgi';
             return true;
         }
@@ -426,8 +519,104 @@ class HsgqDriver implements OltDriverInterface
             return true;
         }
 
-        $oltMessage = $res['message'] ?? $res['msg'] ?? 'Username atau Password ditolak oleh OLT HSGQ.';
-        throw new Exception("Login ke OLT HSGQ gagal ({$oltMessage})");
+        $this->lastAuthError = [
+            'stage'       => 'auth_endpoint',
+            'olt_code'    => null,
+            'olt_message' => null,
+            'cause'       => 'Tidak ada endpoint login HSGQ yang dikenali (userlogin, login.cgi, api/login). Firmware/web server mungkin berbeda atau port bukan port Web OLT.',
+            'solution'    => 'Pastikan HSGQ_PORT mengarah ke port Web Management OLT (biasanya 80) dan halaman login Web dapat dibuka di browser.',
+        ];
+        throw new Exception('Login ke OLT HSGQ gagal: ' . $this->lastAuthError['cause']);
+    }
+
+    /**
+     * Menerjemahkan kode/pesan error login firmware HSGQ menjadi penyebab & solusi yang spesifik.
+     */
+    private function explainLoginError(int $code, string $message): array
+    {
+        $lower = strtolower($message);
+        $user  = $this->config['username'];
+
+        if (strpos($lower, 'not exist') !== false) {
+            $cause    = "Username '{$user}' tidak terdaftar di OLT HSGQ.";
+            $solution = 'Periksa HSGQ_USERNAME di .env (huruf besar/kecil berpengaruh) dan pastikan akun tersebut ada di menu User Management OLT.';
+        } elseif (strpos($lower, 'password') !== false) {
+            $cause    = "Password untuk username '{$user}' ditolak oleh OLT HSGQ.";
+            $solution = 'Periksa HSGQ_PASSWORD di .env. Pastikan sama dengan password login Web OLT.';
+        } elseif (strpos($lower, 'lock') !== false || strpos($lower, 'too many') !== false) {
+            $cause    = 'Akun dikunci sementara oleh OLT karena terlalu banyak percobaan login gagal.';
+            $solution = 'Tunggu beberapa menit sebelum mencoba kembali.';
+        } elseif (strpos($lower, 'online') !== false || strpos($lower, 'max') !== false || strpos($lower, 'session') !== false) {
+            $cause    = 'Batas sesi login OLT penuh atau akun sedang dipakai di sesi lain.';
+            $solution = 'Logout dari sesi Web OLT yang lain, lalu coba kembali.';
+        } elseif (strpos($lower, 'captcha') !== false || strpos($lower, 'verif') !== false) {
+            $cause    = 'Firmware OLT meminta captcha/verifikasi pada login.';
+            $solution = 'Nonaktifkan captcha pada pengaturan login Web OLT atau gunakan metode Telnet (HSGQ_METHOD=telnet).';
+        } else {
+            $cause    = 'OLT HSGQ menolak login.';
+            $solution = 'Periksa kembali HSGQ_USERNAME dan HSGQ_PASSWORD di .env.';
+        }
+
+        return [
+            'stage'       => 'auth',
+            'olt_code'    => $code,
+            'olt_message' => $message,
+            'cause'       => $cause,
+            'solution'    => $solution,
+        ];
+    }
+
+    /**
+     * Membaca informasi perangkat (model, firmware, jumlah port PON) dari endpoint board_info.
+     * Endpoint ini read-only dan dipakai oleh halaman dashboard Web HSGQ.
+     */
+    private function loadBoardInfo(): ?array
+    {
+        if ($this->boardInfo !== null) {
+            return $this->boardInfo;
+        }
+        $res = $this->httpRequest('board_info?_=' . round(microtime(true) * 1000));
+        if (isset($res['code']) && (int)$res['code'] === 1 && isset($res['data']) && is_array($res['data'])) {
+            $d = $res['data'];
+            $this->boardInfo = [
+                'product_name' => $d['product_name'] ?? null,
+                'fw_ver'       => $d['fw_ver'] ?? null,
+                'sys_ver'      => $d['sys_ver'] ?? null,
+                'hw_ver'       => $d['hw_ver'] ?? null,
+                'pon_ports'    => isset($d['ponports']) && is_numeric($d['ponports']) ? (int)$d['ponports'] : null,
+            ];
+        }
+        return $this->boardInfo;
+    }
+
+    /**
+     * Jumlah port PON yang dipindai: memakai nilai dari board_info OLT bila tersedia,
+     * selain itu memakai HSGQ_PON_PORTS dari .env.
+     */
+    private function getEffectivePonPorts(): int
+    {
+        $detected = $this->boardInfo['pon_ports'] ?? null;
+        if (is_int($detected) && $detected > 0) {
+            return $detected;
+        }
+        return max(1, (int)$this->config['pon_ports']);
+    }
+
+    /**
+     * Request ke endpoint data per-PON; endpoint yang membalas HTTP 404 dicatat sebagai
+     * tidak didukung firmware sehingga tidak diminta ulang untuk port berikutnya.
+     */
+    private function requestDataEndpoint(string $name, string $query): ?array
+    {
+        if (isset($this->unsupportedEndpoints[$name])) {
+            return null;
+        }
+        $res = $this->httpRequest($name . '?' . $query);
+        if ($this->lastHttpCode === 404) {
+            $this->unsupportedEndpoints[$name] = true;
+            return null;
+        }
+        return $res;
     }
 
     /**
@@ -436,21 +625,23 @@ class HsgqDriver implements OltDriverInterface
     private function fetchViaHttpApi(string $fetchedAt): array
     {
         $this->loginHttp();
+        $this->loadBoardInfo();
 
-        $portCount = max(1, (int)$this->config['pon_ports']);
+        $portCount = $this->getEffectivePonPorts();
         $ts        = round(microtime(true) * 1000);
         $records   = [];
 
-        // Jika filter pon_port spesifik diberikan, kita hanya perlu memindai port tersebut
         for ($port = 1; $port <= $portCount; $port++) {
-            $listData  = $this->httpRequest("onu_list?port_id={$port}&_={$ts}");
-            $allowData = null;
-            if (!isset($listData['data']) || empty($listData['data'])) {
-                $allowData = $this->httpRequest("onu_allow_list?port_id={$port}&_={$ts}");
-            }
+            $q = "port_id={$port}&_={$ts}";
 
-            $optData  = $this->httpRequest("onu_optical_info?port_id={$port}&_={$ts}");
-            $infoData = $this->httpRequest("onu_info?port_id={$port}&_={$ts}");
+            // Firmware HSGQ EPON (mis. HSGQ-E04R V3.5.x) menyediakan daftar ONU + receive_power
+            // melalui onu_allow_list, serta Tx Power + Rx Power + Suhu melalui ponmgmt?form=optical_onu.
+            // Endpoint yang membalas 404 dicatat dan tidak diminta ulang di port berikutnya.
+            $allowData  = $this->requestDataEndpoint('onu_allow_list', $q);
+            $ponOptData = $this->requestDataEndpoint('ponmgmt', "form=optical_onu&{$q}");
+            $listData   = $this->requestDataEndpoint('onu_list', $q);
+            $optData    = $this->requestDataEndpoint('onu_optical_info', $q);
+            $infoData   = $this->requestDataEndpoint('onu_info', $q);
 
             // Dukungan tambahan untuk firmware HSGQ GPON (gponont_mgmt)
             $gponAuth = null;
@@ -460,13 +651,13 @@ class HsgqDriver implements OltDriverInterface
                 (!isset($allowData['data']) || empty($allowData['data'])) &&
                 (!isset($optData['data']) || empty($optData['data']))
             ) {
-                $gponAuth = $this->httpRequest("gponont_mgmt?form=auth&port_id={$port}&_={$ts}");
-                $gponOpt  = $this->httpRequest("gponont_mgmt?form=optical&port_id={$port}&_={$ts}");
+                $gponAuth = $this->requestDataEndpoint('gponont_mgmt', "form=auth&{$q}");
+                $gponOpt  = isset($this->unsupportedEndpoints['gponont_mgmt']) ? null : $this->httpRequest("gponont_mgmt?form=optical&{$q}");
             }
 
             // Gabungkan seluruh data berdasarkan onu_id pada port ini
             $mergedByOnuId = [];
-            $sources       = [$listData, $allowData, $infoData, $optData, $gponAuth, $gponOpt];
+            $sources       = [$listData, $allowData, $infoData, $optData, $ponOptData, $gponAuth, $gponOpt];
 
             foreach ($sources as $src) {
                 if (!isset($src['data']) || !is_array($src['data'])) {
@@ -519,6 +710,7 @@ class HsgqDriver implements OltDriverInterface
                         ?? $onu['temperature']
                         ?? $onu['work_temp']
                         ?? $onu['work_temperature']
+                        ?? $onu['work_temprature']
                         ?? null;
 
                 $tempVal = null;

@@ -147,6 +147,14 @@ foreach ($report['results'] as $brandKey => $res) {
     }
     echo "    Pesan          : " . ($res['message'] ?? '-') . PHP_EOL;
 
+    if (!empty($res['steps'])) {
+        $st = $res['steps'];
+        echo "    Tahap Uji IP   : [" . strtoupper($st['ip_reachability']['status'] ?? '-') . "] " . ($st['ip_reachability']['detail'] ?? '-') . PHP_EOL;
+        echo "    Tahap Uji Port : [" . strtoupper($st['port_access']['status'] ?? '-') . "] " . ($st['port_access']['detail'] ?? '-') . PHP_EOL;
+        echo "    Tahap Login    : [" . strtoupper($st['authentication']['status'] ?? '-') . "] " . ($st['authentication']['detail'] ?? '-') . PHP_EOL;
+        echo "    Tahap Data ONU : [" . strtoupper($st['onu_data_fetch']['status'] ?? '-') . "] " . ($st['onu_data_fetch']['detail'] ?? '-') . PHP_EOL;
+    }
+
     if (!empty($res['reading_validation'])) {
         $val = $res['reading_validation'];
         echo "    Validasi Data  : " . ($val['validation_message'] ?? '-') . PHP_EOL;
@@ -157,7 +165,11 @@ foreach ($report['results'] as $brandKey => $res) {
 
     if (!empty($res['sample_onu'])) {
         $s = $res['sample_onu'];
-        echo "    Sampel ONU #1  : [{$s['onu_id']}] {$s['onu_name']} | SN: {$s['sn']} | Status: {$s['status_label']} | Rx: " . ($s['rx_power_formatted'] ?? 'N/A') . " | Tx: " . ($s['tx_power_formatted'] ?? 'N/A') . PHP_EOL;
+        echo "    Sampel ONU #1  : [{$s['onu_id']}] {$s['onu_name']} | Slot/PON: {$s['slot_pon']} | SN: {$s['sn']} | Status: {$s['status_label']} | Rx: " . ($s['rx_power_formatted'] ?? 'N/A') . " | Tx: " . ($s['tx_power_formatted'] ?? 'N/A') . " | Waktu: {$s['fetched_at']}" . PHP_EOL;
+    }
+
+    if (empty($res['success']) && !empty($res['failure_cause']['cause'])) {
+        echo "    Penyebab Gagal : " . $res['failure_cause']['cause'] . PHP_EOL;
     }
 
     if (empty($res['success']) && !empty($res['diagnostics']['hints'])) {

@@ -152,12 +152,18 @@ class OnuDataNormalizer
     public static function normalizeStatus($rawStatus, ?float $rxPower = null): array
     {
         $str = strtolower(trim((string)$rawStatus));
-        $onlineTokens = ['1', 'up', 'online', 'active', 'registered', 'authenticated', 'auth', 'working', 'enable', 'enabled', 'true'];
+        $onlineTokens  = ['1', 'up', 'online', 'active', 'registered', 'authenticated', 'auth', 'working', 'enable', 'enabled', 'true'];
+        $offlineTokens = ['0', '2', 'down', 'offline', 'pwrdown', 'powerdown', 'power_off', 'wiredown', 'los', 'losi', 'lofi', 'dyinggasp', 'dying_gasp', 'deregistered', 'unauthenticated', 'disable', 'disabled', 'false'];
 
-        $isOnline = in_array($str, $onlineTokens, true);
+        $isOnline          = in_array($str, $onlineTokens, true);
+        $isExplicitOffline = in_array($str, $offlineTokens, true)
+            || strpos($str, 'down') !== false
+            || strpos($str, 'offline') !== false
+            || strpos($str, 'los') !== false
+            || strpos($str, 'dying') !== false;
 
-        // Jika status dari tabel utama belum jelas namun terdapat sinyal Rx Power valid (< 0 dan > -40), maka ONU aktif
-        if (!$isOnline && $rxPower !== null && $rxPower < 0.0 && $rxPower > -39.5) {
+        // Hanya infer online dari Rx Power apabila status mentah kosong/tidak diketahui (bukan eksplisit offline seperti PwrDown)
+        if (!$isOnline && !$isExplicitOffline && ($str === '' || $str === 'unknown' || $str === 'n/a') && $rxPower !== null && $rxPower < 0.0 && $rxPower > -39.5) {
             $isOnline = true;
         }
 
@@ -174,23 +180,43 @@ class OnuDataNormalizer
      */
     public static function normalizeOnuRecord(array $input, string $brand, string $oltName, string $oltHost, string $fetchedAt): array
     {
-        $rxPower = array_key_exists('rx_power_parsed', $input)
+        $parsedRx = array_key_exists('rx_power_parsed', $input)
             ? $input['rx_power_parsed']
             : self::parseOpticalPower($input['rx_power'] ?? null, false);
 
-        $txPower = array_key_exists('tx_power_parsed', $input)
+        $parsedTx = array_key_exists('tx_power_parsed', $input)
             ? $input['tx_power_parsed']
             : self::parseOpticalPower($input['tx_power'] ?? null, true);
 
         $oltRxPower = self::parseOpticalPower($input['olt_rx_power'] ?? null, false);
 
-        $statusInfo = self::normalizeStatus($input['status'] ?? 'offline', $rxPower);
+        $statusInfo = self::normalizeStatus($input['status'] ?? 'offline', $parsedRx);
+
+        // Jika ONU berstatus offline (misal PwrDown / LOS), daya optik aktif saat ini adalah null,
+        // sedangkan nilai histori terakhir dari OLT disimpan pada last_rx_power
+        $rxPower     = $statusInfo['is_online'] ? $parsedRx : null;
+        $txPower     = $statusInfo['is_online'] ? $parsedTx : null;
+        $lastRxPower = !$statusInfo['is_online'] ? $parsedRx : null;
+
         $signalInfo = self::evaluateSignalQuality($rxPower, $statusInfo['is_online']);
 
         $ponPort   = (string)($input['pon_port'] ?? '1');
+        $slot      = isset($input['slot']) && $input['slot'] !== '' ? (string)$input['slot'] : '0/1';
         $onuNumber = isset($input['onu_number']) ? (int)$input['onu_number'] : null;
         $onuId     = (string)($input['onu_id'] ?? ($onuNumber !== null ? "{$ponPort}/{$onuNumber}" : $ponPort));
         $onuIndex  = (string)($input['onu_index'] ?? $onuId);
+
+        // Ekstrak slot otomatis jika onu_id berformat "0/1/2:5" atau "0/1:3"
+        if (!isset($input['slot'])) {
+            if (preg_match('/^(\d+\/\d+)\/(\d+):(\d+)$/', $onuId, $sm)) {
+                $slot    = $sm[1];
+                $ponPort = $sm[2];
+            } elseif (preg_match('/^(\d+)\/(\d+)$/', $onuId, $sm2)) {
+                $slot    = '0/1';
+                $ponPort = $sm2[1];
+            }
+        }
+        $slotPon = "{$slot}/{$ponPort}";
 
         $snRaw = trim((string)($input['sn'] ?? 'N/A'));
         if ($snRaw === '' || $snRaw === '-') {
@@ -221,19 +247,23 @@ class OnuDataNormalizer
             'olt_host'           => $oltHost,
             'onu_id'             => $onuId,
             'onu_index'          => $onuIndex,
+            'slot'               => $slot,
             'pon_port'           => $ponPort,
-            'pon_label'          => stripos($ponPort, 'PON') === 0 ? $ponPort : "PON {$ponPort}",
+            'slot_pon'           => $slotPon,
+            'pon_label'          => stripos($ponPort, 'PON') === 0 ? $ponPort : "PON {$slotPon}",
             'onu_number'         => $onuNumber,
             'onu_name'           => trim((string)($input['onu_name'] ?? "ONU-{$onuId}")),
             'sn'                 => $snRaw,
             'mac_address'        => $macAddr,
             'status'             => $statusInfo['status'],
             'status_label'       => $statusInfo['status_label'],
+            'raw_status'         => $statusInfo['raw_status'],
             'is_online'          => $statusInfo['is_online'],
             'rx_power'           => $rxPower,
             'rx_power_formatted' => $rxPower !== null ? number_format($rxPower, 2, '.', '') . ' dBm' : null,
             'tx_power'           => $txPower,
             'tx_power_formatted' => $txPower !== null ? number_format($txPower, 2, '.', '') . ' dBm' : null,
+            'last_rx_power'      => $lastRxPower,
             'olt_rx_power'       => $oltRxPower,
             'signal_quality'     => $signalInfo['quality'],
             'signal_label'       => $signalInfo['label'],
