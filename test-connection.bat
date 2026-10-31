@@ -12,3 +12,4 @@ if not exist "%PHP_BIN%" set "PHP_BIN=php"
 
 echo.
 pause
+

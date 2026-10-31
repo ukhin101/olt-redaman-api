@@ -144,11 +144,11 @@ CACHE_TTL_SECONDS=30
 # --- 1. KONFIGURASI OLT HSGQ ---
 HSGQ_ENABLED=true
 HSGQ_NAME="OLT-HSGQ-01"
-HSGQ_HOST=192.168.150.2
+HSGQ_HOST=192.168.1.10
 HSGQ_PORT=80
 HSGQ_SCHEME=http
-HSGQ_USERNAME=admin
-HSGQ_PASSWORD=isi_password_hsgq_anda
+HSGQ_USERNAME=your_hsgq_username
+HSGQ_PASSWORD=your_hsgq_password_here
 HSGQ_METHOD=http
 HSGQ_TYPE=EPON
 HSGQ_PON_PORTS=8
@@ -157,15 +157,15 @@ HSGQ_TIMEOUT=15
 # --- 2. KONFIGURASI OLT HIOSO ---
 HIOSO_ENABLED=true
 HIOSO_NAME="OLT-HIOSO-01"
-HIOSO_HOST=192.168.0.88
+HIOSO_HOST=192.168.1.20
 HIOSO_METHOD=auto
 HIOSO_SNMP_PORT=161
 HIOSO_SNMP_COMMUNITY=public
 HIOSO_SNMP_PROFILE=auto
 HIOSO_HTTP_PORT=80
 HIOSO_TELNET_PORT=23
-HIOSO_USERNAME=admin
-HIOSO_PASSWORD=isi_password_hioso_anda
+HIOSO_USERNAME=your_hioso_username
+HIOSO_PASSWORD=your_hioso_password_here
 HIOSO_TYPE=EPON
 HIOSO_PON_PORTS=4
 HIOSO_TIMEOUT=15
@@ -363,3 +363,4 @@ Untuk menguji koneksi OLT dan memvalidasi pembacaan redaman:
 - File `.env` **tidak pernah** dimasukkan ke dalam Git karena telah diblokir oleh `.gitignore`.
 - Gunakan file `.env.example` sebagai acuan saat melakukan *clone* di perangkat baru.
 - Untuk mengunggah pembaruan ke GitHub, cukup jalankan **`push-github.bat`** atau perintah Git standar di dalam folder `C:\xampp\htdocs\olt-redaman-api`.
+

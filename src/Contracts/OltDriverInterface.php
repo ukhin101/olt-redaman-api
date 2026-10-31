@@ -60,3 +60,4 @@ interface OltDriverInterface
      */
     public function fetchOpticalData(array $filters = []): array;
 }
+

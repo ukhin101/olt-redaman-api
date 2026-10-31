@@ -182,7 +182,7 @@ class EnvLoader
             'enabled'     => self::getBool('HSGQ_ENABLED', true),
             'brand'       => 'HSGQ',
             'name'        => (string)self::get('HSGQ_NAME', 'OLT-HSGQ-01'),
-            'host'        => trim((string)self::get('HSGQ_HOST', '192.168.150.2')),
+            'host'        => trim((string)self::get('HSGQ_HOST', '192.168.1.10')),
             'port'        => self::getInt('HSGQ_PORT', 80),
             'scheme'      => strtolower(trim((string)self::get('HSGQ_SCHEME', 'http'))),
             'username'    => trim((string)self::get('HSGQ_USERNAME', 'admin')),
@@ -194,7 +194,7 @@ class EnvLoader
             'telnet_port' => self::getInt('HSGQ_TELNET_PORT', 23),
         ];
 
-        // Jika host mengandung ":port" (contoh: 192.168.150.2:9154), pisahkan secara otomatis
+        // Jika host mengandung ":port" (contoh: 192.168.1.10:8080), pisahkan secara otomatis
         $cleanHost = preg_replace('#^https?://#i', '', $config['host']);
         $cleanHost = rtrim($cleanHost, '/');
         if (strpos($cleanHost, ':') !== false) {
@@ -220,7 +220,7 @@ class EnvLoader
             'enabled'          => self::getBool('HIOSO_ENABLED', true),
             'brand'            => 'HIOSO',
             'name'             => (string)self::get('HIOSO_NAME', 'OLT-HIOSO-01'),
-            'host'             => trim((string)self::get('HIOSO_HOST', '192.168.0.88')),
+            'host'             => trim((string)self::get('HIOSO_HOST', '192.168.1.20')),
             'method'           => strtolower(trim((string)self::get('HIOSO_METHOD', 'auto'))),
             'snmp_port'        => self::getInt('HIOSO_SNMP_PORT', 161),
             'snmp_community'   => trim((string)self::get('HIOSO_SNMP_COMMUNITY', 'public')),
@@ -313,3 +313,4 @@ class EnvLoader
         ];
     }
 }
+

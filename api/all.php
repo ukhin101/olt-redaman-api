@@ -48,3 +48,4 @@ $result   = $manager->getCombinedData($params, (bool)$params['refresh']);
 $httpCode = !empty($result['success']) ? 200 : 503;
 
 ResponseHelper::sendJson($result, $httpCode);
+

@@ -51,3 +51,4 @@ class Logger
         @file_put_contents(self::getLogFilePath(), $line, FILE_APPEND | LOCK_EX);
     }
 }
+

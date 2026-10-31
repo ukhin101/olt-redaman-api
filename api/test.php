@@ -32,3 +32,4 @@ $testReport = $manager->testAndValidate((string)$brand, $validateReading);
 $httpCode   = !empty($testReport['success']) ? 200 : 503;
 
 ResponseHelper::sendJson($testReport, $httpCode);
+

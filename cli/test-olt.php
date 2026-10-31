@@ -28,39 +28,91 @@ echo "Ekstensi SNMP   : " . (extension_loaded('snmp') ? '[OK] Aktif (Native PHP 
 echo "File .env       : " . (EnvLoader::isEnvFilePresent() ? '[OK] Ditemukan (.env)' : '[PERINGATAN] Belum ada file .env (menggunakan nilai default)') . PHP_EOL;
 echo "----------------------------------------------------------------------------" . PHP_EOL;
 
-// 1. Validasi Internal Parser & Normalizer Redaman (Self-Test)
-echo PHP_EOL . "[1/2] Menjalankan Validasi Internal Parser Redaman Optik..." . PHP_EOL;
+// 1. Validasi Internal Parser & Uji Mandiri Modul HSGQ + HIOSO (Self-Test)
+echo PHP_EOL . "[1/2] Menjalankan Pengujian Mandiri Modul HSGQ, HIOSO & Normalizer..." . PHP_EOL;
+
+$hsgqDriver  = new \OltRedaman\Drivers\HsgqDriver();
+$hiosoDriver = new \OltRedaman\Drivers\HiosoDriver();
+
+// Simulasi uji mandiri modul HSGQ (Telnet CLI parser + Normalizer)
+$refHsgqTelnet = new \ReflectionMethod($hsgqDriver, 'parseTelnetOutput');
+$refHsgqTelnet->setAccessible(true);
+$hsgqMockRecords = $refHsgqTelnet->invoke(
+    $hsgqDriver,
+    "1/1   00:11:41:24:11:da   Online   -17.85   2.10   LITA\n1/2   98:45:62:c5:84:c3   Offline   ---   ---   BUDI\n",
+    date('c')
+);
+
+// Simulasi uji mandiri modul HIOSO (HTML ASP parser + Telnet CLI parser)
+$refHiosoHtml = new \ReflectionMethod($hiosoDriver, 'parseHtmlOnuRows');
+$refHiosoHtml->setAccessible(true);
+$hiosoHtmlMap = [];
+$refHiosoHtml->invokeArgs($hiosoDriver, [
+    'var onuList = new Array("0/1/1:1", "PELANGGAN_A", "00:11:22:33:44:55", "Online", "-19.45", "1.95");',
+    &$hiosoHtmlMap,
+]);
+
+$refHiosoTelnet = new \ReflectionMethod($hiosoDriver, 'parseTelnetOutput');
+$refHiosoTelnet->setAccessible(true);
+$hiosoTelnetRecords = $refHiosoTelnet->invoke(
+    $hiosoDriver,
+    "0/1/2:3   AA:BB:CC:DD:EE:FF   Online   -21.30   2.05   WARUNG_KOPI\n",
+    date('c')
+);
+
+// Uji Filter ResponseHelper
+$filteredWeak = \OltRedaman\Support\ResponseHelper::applyFilters($hsgqMockRecords, ['status' => 'online']);
 
 $selfTests = [
     [
-        'label'    => 'HSGQ Float String (-22.5181 -> -22.52 dBm)',
+        'label'    => 'Parser HSGQ Float String (-22.5181 -> -22.52 dBm)',
         'actual'   => OnuDataNormalizer::parseOpticalPower('-22.5181', false),
         'expected' => -22.52,
     ],
     [
-        'label'    => 'HSGQ 16-bit Signed Integer (63284 -> -22.52 dBm)',
+        'label'    => 'Parser HSGQ 16-bit Signed Integer (63284 -> -22.52 dBm)',
         'actual'   => OnuDataNormalizer::parseOpticalPower(63284, false),
         'expected' => -22.52,
     ],
     [
-        'label'    => 'HIOSO SNMP String ("-19.40 dBm" -> -19.4 dBm)',
+        'label'    => 'Parser HIOSO SNMP String ("-19.40 dBm" -> -19.4 dBm)',
         'actual'   => OnuDataNormalizer::parseOpticalPower('STRING: "-19.40 dBm"', false),
         'expected' => -19.4,
     ],
     [
-        'label'    => 'HIOSO GPON Scaled Integer (-2485 -> -24.85 dBm)',
+        'label'    => 'Parser HIOSO GPON Scaled Integer (-2485 -> -24.85 dBm)',
         'actual'   => OnuDataNormalizer::parseOpticalPower('-2485', false),
         'expected' => -24.85,
     ],
     [
-        'label'    => 'Tx Power Valid ("2.15" -> 2.15 dBm)',
+        'label'    => 'Parser Tx Power Valid ("2.15" -> 2.15 dBm)',
         'actual'   => OnuDataNormalizer::parseOpticalPower('2.15', true),
         'expected' => 2.15,
     ],
     [
-        'label'    => 'Offline / Sentinel ("---" -> null)',
+        'label'    => 'Parser Offline / Sentinel ("---" -> null)',
         'actual'   => OnuDataNormalizer::parseOpticalPower('---', false),
         'expected' => null,
+    ],
+    [
+        'label'    => 'Modul Mandiri HSGQDriver (Ekstraksi & Normalisasi ONU Online/Offline)',
+        'actual'   => isset($hsgqMockRecords[0]) && $hsgqMockRecords[0]['olt_brand'] === 'HSGQ' && $hsgqMockRecords[0]['rx_power'] === -17.85 && $hsgqMockRecords[1]['status'] === 'offline',
+        'expected' => true,
+    ],
+    [
+        'label'    => 'Modul Mandiri HIOSODriver - Web ASP Parser (0/1/1:1 -> -19.45 dBm)',
+        'actual'   => isset($hiosoHtmlMap['0/1/1:1']) && $hiosoHtmlMap['0/1/1:1']['rx_power'] === -19.45,
+        'expected' => true,
+    ],
+    [
+        'label'    => 'Modul Mandiri HIOSODriver - CLI Parser (0/1/2:3 -> -21.3 dBm)',
+        'actual'   => isset($hiosoTelnetRecords[0]) && $hiosoTelnetRecords[0]['olt_brand'] === 'HIOSO' && $hiosoTelnetRecords[0]['rx_power'] === -21.3,
+        'expected' => true,
+    ],
+    [
+        'label'    => 'Filter API & SDK Client (Filter Status Online)',
+        'actual'   => count($filteredWeak) === 1 && $filteredWeak[0]['onu_id'] === '1/1',
+        'expected' => true,
     ],
 ];
 
@@ -117,3 +169,4 @@ foreach ($report['results'] as $brandKey => $res) {
 
 echo PHP_EOL . "============================================================================" . PHP_EOL;
 echo "Selesai dalam " . $report['execution_time_ms'] . " ms." . PHP_EOL;
+

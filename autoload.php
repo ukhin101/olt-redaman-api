@@ -32,3 +32,4 @@ $timezone = \OltRedaman\Config\EnvLoader::get('APP_TIMEZONE', 'Asia/Jakarta');
 if (!empty($timezone)) {
     @date_default_timezone_set($timezone);
 }
+
