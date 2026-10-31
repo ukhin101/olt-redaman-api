@@ -1,0 +1,24 @@
+# ============================================================================
+# .htaccess - Keamanan & Konfigurasi Apache XAMPP untuk OLT Redaman API
+# ============================================================================
+
+<IfModule mod_headers.c>
+    # Izinkan akses CORS agar mudah diintegrasikan dengan Monitoring Map FTTH
+    Header always set Access-Control-Allow-Origin "*"
+    Header always set Access-Control-Allow-Methods "GET, POST, OPTIONS"
+    Header always set Access-Control-Allow-Headers "Content-Type, Authorization, X-API-Key, X-Requested-With"
+</IfModule>
+
+# Blokir akses publik ke file sensitif (.env, .git, composer.json, log, cookie)
+<FilesMatch "^(\.env|\.env\..*|\.gitignore|composer\.(json|lock)|.*\.cookie|.*\.log)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Nonaktifkan directory listing demi keamanan
+Options -Indexes

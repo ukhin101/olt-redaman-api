@@ -1,0 +1,36 @@
+# ============================================================================
+# .gitignore - OLT Redaman API (HSGQ & HIOSO)
+# ============================================================================
+# JANGAN PERNAH menyimpan kredensial / password OLT ke repository GitHub!
+.env
+.env.*
+!.env.example
+
+# File sesi & cookie cURL sementara
+*.cookie
+*.session
+cookie.txt
+session_*.txt
+hsgq_*.txt
+hioso_*.txt
+
+# Penyimpanan cache dan log lokal
+storage/cache/*
+!storage/cache/.gitkeep
+storage/logs/*
+!storage/logs/.gitkeep
+
+# Dependensi eksternal jika menggunakan Composer / Node
+vendor/
+node_modules/
+
+# File sistem operasi & editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.bak
+*.tmp
+*.swp
+.vscode/
+.idea/

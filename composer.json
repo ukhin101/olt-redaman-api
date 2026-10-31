@@ -1,0 +1,19 @@
+{
+    "name": "ukhin101/olt-redaman-api",
+    "description": "Standalone modular backend & REST API untuk mengambil data redaman optik (Rx/Tx Power) ONT/ONU dari OLT HSGQ dan HIOSO.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "suggest": {
+        "ext-snmp": "Direkomendasikan untuk pembacaan SNMP cepat pada OLT HIOSO (memiliki fallback otomatis ke snmpwalk CLI / HTTP / Telnet)"
+    },
+    "autoload": {
+        "psr-4": {
+            "OltRedaman\\": "src/"
+        }
+    }
+}
