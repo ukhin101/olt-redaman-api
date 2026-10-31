@@ -212,7 +212,7 @@ Setiap ONU yang dikembalikan oleh endpoint `hsgq.php`, `hioso.php`, maupun `all.
   "success": true,
   "brand": "HSGQ",
   "olt_name": "OLT-HSGQ-01",
-  "olt_host": "192.168.150.2:80",
+  "olt_host": "192.168.1.10:80",
   "olt_type": "EPON",
   "pon_ports_scanned": 8,
   "method_used": "http (userlogin_json)",
@@ -257,7 +257,7 @@ Setiap ONU yang dikembalikan oleh endpoint `hsgq.php`, `hioso.php`, maupun `all.
     {
       "olt_brand": "HSGQ",
       "olt_name": "OLT-HSGQ-01",
-      "olt_host": "192.168.150.2",
+      "olt_host": "192.168.1.10",
       "onu_id": "1/1",
       "onu_index": "1/1",
       "pon_port": "1",

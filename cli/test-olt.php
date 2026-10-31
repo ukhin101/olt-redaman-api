@@ -44,11 +44,12 @@ $hsgqMockRecords = $refHsgqTelnet->invoke(
 );
 
 // Simulasi uji mandiri modul HIOSO (HTML ASP parser + Telnet CLI parser)
-$refHiosoHtml = new \ReflectionMethod($hiosoDriver, 'parseHtmlOnuRows');
+$refHiosoHtml = new \ReflectionMethod($hiosoDriver, 'parseHiosoAspHtml');
 $refHiosoHtml->setAccessible(true);
 $hiosoHtmlMap = [];
 $refHiosoHtml->invokeArgs($hiosoDriver, [
     'var onuList = new Array("0/1/1:1", "PELANGGAN_A", "00:11:22:33:44:55", "Online", "-19.45", "1.95");',
+    1,
     &$hiosoHtmlMap,
 ]);
 
@@ -60,8 +61,8 @@ $hiosoTelnetRecords = $refHiosoTelnet->invoke(
     date('c')
 );
 
-// Uji Filter ResponseHelper
-$filteredWeak = \OltRedaman\Support\ResponseHelper::applyFilters($hsgqMockRecords, ['status' => 'online']);
+// Uji Filter OnuDataNormalizer
+$filteredWeak = OnuDataNormalizer::applyFilters($hsgqMockRecords, ['status' => 'online']);
 
 $selfTests = [
     [
